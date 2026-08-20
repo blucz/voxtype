@@ -39,6 +39,10 @@ pub struct AudioConfig {
     #[serde(default = "default_duck_media_volume_percent")]
     pub duck_media_volume_percent: u8,
 
+    /// Fade duration in milliseconds for the ducking ramp (0 = instant)
+    #[serde(default = "default_duck_media_fade_ms")]
+    pub duck_media_fade_ms: u32,
+
     /// Audio feedback settings
     #[serde(default)]
     pub feedback: AudioFeedbackConfig,
@@ -54,6 +58,7 @@ impl Default for AudioConfig {
             pause_media_ignored_players: Vec::new(),
             duck_media: false,
             duck_media_volume_percent: default_duck_media_volume_percent(),
+            duck_media_fade_ms: default_duck_media_fade_ms(),
             feedback: AudioFeedbackConfig::default(),
         }
     }
@@ -73,6 +78,10 @@ fn default_audio_max_duration_secs() -> u32 {
 
 fn default_duck_media_volume_percent() -> u8 {
     70
+}
+
+fn default_duck_media_fade_ms() -> u32 {
+    150
 }
 
 /// Audio feedback configuration for sound cues
