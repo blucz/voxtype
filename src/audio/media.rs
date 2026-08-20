@@ -30,6 +30,7 @@ mod imp {
     use super::DuckedMediaStream;
     use serde_json::Value;
     use tokio::process::Command;
+    use tokio::task::JoinHandle;
     use tracing::{debug, warn};
     use zbus::{fdo::DBusProxy, Connection, Proxy};
 
@@ -115,22 +116,10 @@ mod imp {
         debug!("Resumed {}/{} media player(s)", resumed, players.len());
     }
 
-    /// Lower active sink-input volumes and return their original volumes.
-    ///
-    /// This intentionally does not use MPRIS transport controls. It can be
-    /// enabled alongside `pause_media`, but when both are enabled the pause
-    /// feature keeps its existing start/stop behavior and ducking only manages
-    /// stream volume.
     /// Interval between ramp steps. Short enough to sound continuous, long
     /// enough to keep the number of `pactl` invocations per fade small.
     const FADE_STEP_MS: u64 = 20;
 
-    /// Ramp all `streams` from `from_percent` to `to_percent` of their
-    /// original volume over `fade_ms`, leaving the final value to the caller
-    /// (which keeps the existing per-stream error handling in one place).
-    ///
-    /// Best effort: a step that fails is ignored, because the caller sets the
-    /// exact target right afterwards anyway.
     /// Intermediate scaling factors for a fade, excluding the final target.
     ///
     /// The caller sets `to_percent` itself, which keeps the exact target and
@@ -152,16 +141,18 @@ mod imp {
             .collect()
     }
 
+    /// Walk `streams` from `from_percent` towards `to_percent` over `fade_ms`,
+    /// stopping short of the target — the caller writes that itself, which
+    /// keeps the exact value and its error handling in one place.
+    ///
+    /// Best effort: a failed intermediate step is ignored, since the caller's
+    /// final write is authoritative.
     async fn ramp_streams(
         streams: &[DuckedMediaStream],
         from_percent: u8,
         to_percent: u8,
         fade_ms: u32,
     ) {
-        if streams.is_empty() {
-            return;
-        }
-
         for factor in ramp_factors(from_percent, to_percent, fade_ms) {
             for stream in streams {
                 let _ = Command::new("pactl")
@@ -175,30 +166,15 @@ mod imp {
         }
     }
 
-    pub async fn duck_playing_audio(volume_percent: u8, fade_ms: u32) -> Vec<DuckedMediaStream> {
-        let streams = match list_active_sink_inputs().await {
-            Ok(streams) => streams,
-            Err(e) => {
-                warn!("Failed to enumerate audio streams for media ducking: {e}");
-                return Vec::new();
-            }
-        };
-
-        if streams.is_empty() {
-            debug!("No active audio streams found for media ducking");
-            return Vec::new();
-        }
-
-        let factor = volume_percent.min(150);
-        ramp_streams(&streams, 100, factor, fade_ms).await;
-        let mut ducked = Vec::new();
+    /// Set every stream to `amplitude_percent` of its original volume.
+    async fn apply_volumes(streams: &[DuckedMediaStream], amplitude_percent: u8) {
         for stream in streams {
-            let target = scaled_volumes(&stream.volumes, factor);
+            let target = scaled_volumes(&stream.volumes, amplitude_percent);
             debug!(
                 stream = stream.index,
                 from = ?stream.volumes,
                 to = ?target,
-                factor_percent = factor,
+                factor_percent = amplitude_percent,
                 "Ducking media stream"
             );
             match Command::new("pactl")
@@ -208,7 +184,7 @@ mod imp {
                 .status()
                 .await
             {
-                Ok(status) if status.success() => ducked.push(stream),
+                Ok(status) if status.success() => {}
                 Ok(status) => warn!(
                     stream = stream.index,
                     "Media ducking failed with status: {status}"
@@ -219,8 +195,46 @@ mod imp {
                 ),
             }
         }
+    }
 
-        ducked
+    /// Lower active sink-input volumes and return their original volumes.
+    ///
+    /// This intentionally does not use MPRIS transport controls. It can be
+    /// enabled alongside `pause_media`, but when both are enabled the pause
+    /// feature keeps its existing start/stop behavior and ducking only manages
+    /// stream volume.
+    ///
+    /// The originals are captured before anything is written, and the fade
+    /// itself runs on a spawned task so the caller can open the microphone
+    /// without waiting out `fade_ms`. The returned handle is that task: the
+    /// caller must await it before capturing originals again, or a second
+    /// recording started mid-fade would record intermediate volumes as the new
+    /// "originals" and media would drift permanently quieter.
+    pub async fn duck_playing_audio(
+        volume_percent: u8,
+        fade_ms: u32,
+    ) -> (Vec<DuckedMediaStream>, Option<JoinHandle<()>>) {
+        let streams = match list_active_sink_inputs().await {
+            Ok(streams) => streams,
+            Err(e) => {
+                warn!("Failed to enumerate audio streams for media ducking: {e}");
+                return (Vec::new(), None);
+            }
+        };
+
+        if streams.is_empty() {
+            debug!("No active audio streams found for media ducking");
+            return (Vec::new(), None);
+        }
+
+        let factor = volume_percent.min(150);
+        let fading = streams.clone();
+        let handle = tokio::spawn(async move {
+            ramp_streams(&fading, 100, factor, fade_ms).await;
+            apply_volumes(&fading, factor).await;
+        });
+
+        (streams, Some(handle))
     }
 
     /// Restore stream volumes captured by `duck_playing_audio`.
@@ -326,7 +340,17 @@ mod imp {
             .collect()
     }
 
-    fn scaled_volumes(volumes: &[String], factor_percent: u8) -> Vec<String> {
+    /// Scale each channel's `value_percent` so the stream keeps
+    /// `amplitude_percent` of its current amplitude.
+    ///
+    /// PulseAudio's percentage scale is cubic (`amplitude = (percent /
+    /// 100)^3`), so keeping half the amplitude does NOT mean halving the
+    /// percentage: the percentage only shrinks by the cube root of the
+    /// requested fraction. Scaling the percentage directly instead — the
+    /// previous behaviour — cubed the reduction, so a configured 50 left
+    /// 12.5% of the amplitude (-18 dB) and 30 was effectively mute.
+    fn scaled_volumes(volumes: &[String], amplitude_percent: u8) -> Vec<String> {
+        let gain = (f32::from(amplitude_percent) / 100.0).cbrt();
         volumes
             .iter()
             .map(|volume| {
@@ -334,7 +358,7 @@ mod imp {
                 let Ok(value) = numeric.parse::<f32>() else {
                     return volume.clone();
                 };
-                let scaled = value * f32::from(factor_percent) / 100.0;
+                let scaled = value * gain;
                 format!("{scaled:.0}%")
             })
             .collect()
@@ -387,6 +411,24 @@ mod imp {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        /// The cube-root correction changed what `duck_media_volume_percent`
+        /// means, so the shipped default had to move with it or ducking would
+        /// have quietly become nearly inaudible: the old default of 70 was
+        /// applied to PulseAudio's cubic scale and actually left 0.70^3 of the
+        /// amplitude. Pin that the new default reproduces the old depth, since
+        /// a well-meaning "round it back up to 70" would silently undo it.
+        #[test]
+        fn default_duck_percent_preserves_pre_correction_loudness() {
+            let old_default_amplitude = 0.70_f32.powi(3);
+            let new_default_amplitude =
+                f32::from(crate::config::AudioConfig::default().duck_media_volume_percent) / 100.0;
+
+            assert!(
+                (new_default_amplitude - old_default_amplitude).abs() < 0.01,
+                "default duck depth drifted: {new_default_amplitude} vs {old_default_amplitude}"
+            );
+        }
 
         #[tokio::test]
         async fn list_skips_non_mpris_and_playerctld() {
@@ -471,14 +513,37 @@ mod imp {
 
         #[test]
         fn scales_stream_volumes_relative_to_current_values() {
+            // 70% of the amplitude = cube root of 0.7 on the cubic
+            // percentage scale, applied per channel.
             assert_eq!(
                 scaled_volumes(&["100%".to_string(), "80%".to_string()], 70),
-                vec!["70%", "56%"]
+                vec!["89%", "71%"]
             );
             assert_eq!(
                 scaled_volumes(&["50%".to_string(), "25%".to_string()], 30),
-                vec!["15%", "8%"]
+                vec!["33%", "17%"]
             );
+        }
+
+        #[test]
+        fn full_amplitude_leaves_volumes_unchanged() {
+            assert_eq!(
+                scaled_volumes(&["100%".to_string(), "37%".to_string()], 100),
+                vec!["100%", "37%"]
+            );
+        }
+
+        #[test]
+        fn zero_amplitude_mutes() {
+            assert_eq!(scaled_volumes(&["100%".to_string()], 0), vec!["0%"]);
+        }
+
+        #[test]
+        fn half_amplitude_is_six_db_not_eighteen() {
+            // 0.5^(1/3) = 0.7937: half the amplitude keeps ~79% of the cubic
+            // percentage. The pre-change behaviour would have produced "50%",
+            // which is only 12.5% of the amplitude.
+            assert_eq!(scaled_volumes(&["100%".to_string()], 50), vec!["79%"]);
         }
     }
 }
@@ -497,8 +562,11 @@ pub async fn pause_playing_players(_ignored: &[String]) -> Vec<String> {
 pub async fn resume_players(_players: Vec<String>) {}
 
 #[cfg(not(target_os = "linux"))]
-pub async fn duck_playing_audio(_volume_percent: u8, _fade_ms: u32) -> Vec<DuckedMediaStream> {
-    Vec::new()
+pub async fn duck_playing_audio(
+    _volume_percent: u8,
+    _fade_ms: u32,
+) -> (Vec<DuckedMediaStream>, Option<tokio::task::JoinHandle<()>>) {
+    (Vec::new(), None)
 }
 
 #[cfg(not(target_os = "linux"))]
