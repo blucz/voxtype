@@ -65,7 +65,7 @@ pub enum Commands {
 
         /// Specify which model to download (use with --download).
         /// Whisper: tiny, base, small, medium, large-v3, large-v3-turbo (and .en variants).
-        /// Parakeet: parakeet-tdt-0.6b-v3, parakeet-tdt-0.6b-v3-int8
+        /// Parakeet: parakeet-tdt-0.6b-v3, parakeet-tdt-0.6b-v3-int8, parakeet-unified-en-0.6b, parakeet-unified-en-0.6b-int8
         #[arg(long, value_name = "NAME")]
         model: Option<String>,
 

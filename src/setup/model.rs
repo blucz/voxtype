@@ -113,6 +113,13 @@ struct ParakeetModelInfo {
     /// handler auto-switches the configured model to one of these when the
     /// user enables streaming on top of an incompatible model. See #423.
     streaming_compatible: bool,
+    /// Set when this model is produced locally by quantizing another registry
+    /// entry rather than fetched from the artifact mirror. Names the source
+    /// model. `download_parakeet_model` refuses to hit the network for these
+    /// and points at `scripts/quantize-unified-int8.py` instead — there is no
+    /// published artifact to download, by design: quantizing here keeps the
+    /// weights provably identical to the fp32 model already on disk.
+    quantize_from: Option<&'static str>,
 }
 
 const PARAKEET_MODELS: &[ParakeetModelInfo] = &[
@@ -128,6 +135,7 @@ const PARAKEET_MODELS: &[ParakeetModelInfo] = &[
             ("config.json", 97),
         ],
         huggingface_repo: "istupakov/parakeet-tdt-0.6b-v2-onnx",
+        quantize_from: None,
         streaming_compatible: false,
     },
     ParakeetModelInfo {
@@ -141,6 +149,7 @@ const PARAKEET_MODELS: &[ParakeetModelInfo] = &[
             ("config.json", 97),
         ],
         huggingface_repo: "istupakov/parakeet-tdt-0.6b-v2-onnx",
+        quantize_from: None,
         streaming_compatible: false,
     },
     ParakeetModelInfo {
@@ -155,6 +164,7 @@ const PARAKEET_MODELS: &[ParakeetModelInfo] = &[
             ("config.json", 97),
         ],
         huggingface_repo: "istupakov/parakeet-tdt-0.6b-v3-onnx",
+        quantize_from: None,
         streaming_compatible: false,
     },
     ParakeetModelInfo {
@@ -168,6 +178,7 @@ const PARAKEET_MODELS: &[ParakeetModelInfo] = &[
             ("config.json", 97),
         ],
         huggingface_repo: "istupakov/parakeet-tdt-0.6b-v3-onnx",
+        quantize_from: None,
         streaming_compatible: false,
     },
     // Streaming-capable Parakeet model. Ships `tokenizer.model` alongside the
@@ -188,6 +199,31 @@ const PARAKEET_MODELS: &[ParakeetModelInfo] = &[
             ("vocab.txt", 5_164),
         ],
         huggingface_repo: "bobNight/parakeet-unified-en-0.6b-onnx",
+        quantize_from: None,
+        streaming_compatible: true,
+    },
+    // Locally quantized from `parakeet-unified-en-0.6b` via
+    // `scripts/quantize-unified-int8.py`. Same graph, same filenames, QInt8
+    // weights — `ParakeetUnifiedHandle::load` cannot tell the difference, so
+    // this needs no code path of its own beyond the download refusal.
+    //
+    // Measured on this machine (55.8s of speech, 16-core Core Ultra X7 358H,
+    // which has AVX-VNNI): at left=5.6/chunk=0.56/right=0.56 the int8 decode
+    // costs 0.97x realtime CPU against fp32's 1.84x, and emits a
+    // byte-identical transcript. Quantization is a pure win here; the
+    // remaining cost is the buffered-streaming re-encode, not precision.
+    ParakeetModelInfo {
+        name: "parakeet-unified-en-0.6b-int8",
+        size_mb: 665,
+        description: "Streaming-capable, English-only, buffered, int8",
+        files: &[
+            ("encoder.onnx", 655_889_617),
+            ("decoder_joint.onnx", 9_057_824),
+            ("tokenizer.model", 257_024),
+            ("vocab.txt", 5_164),
+        ],
+        huggingface_repo: "bobNight/parakeet-unified-en-0.6b-onnx",
+        quantize_from: Some("parakeet-unified-en-0.6b"),
         streaming_compatible: true,
     },
 ];
@@ -2469,6 +2505,33 @@ pub fn download_parakeet_model(model_name: &str) -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("Unknown Parakeet model: {}", model_name))?;
 
     let models_dir = Config::models_dir();
+
+    // Locally-derived models have no artifact on the mirror. Fetching would
+    // 404 on the manifest and report it as a network fault, which sends you
+    // looking in the wrong place entirely.
+    if let Some(source) = model.quantize_from {
+        let source_dir = models_dir.join(source);
+        let dest_dir = models_dir.join(model.name);
+        if validate_parakeet_model(&dest_dir).is_ok() {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "`{name}` is quantized locally, not downloaded.\n\n\
+             Build it with:\n\n    \
+             python scripts/quantize-unified-int8.py\n\n\
+             That reads `{source}` from {source_dir} and writes `{name}`\n\
+             beside it. {source_note}",
+            name = model.name,
+            source = source,
+            source_dir = source_dir.display(),
+            source_note = if source_dir.exists() {
+                "The source model is present.".to_string()
+            } else {
+                format!("The source model is missing — run `voxtype setup model {source}` first.")
+            },
+        );
+    }
+
     download_artifact(model, &models_dir)?;
     validate_parakeet_model(&models_dir.join(model.name))?;
     Ok(())
