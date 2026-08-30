@@ -11,6 +11,7 @@ pub mod enhance;
 pub mod feedback;
 pub mod levels;
 pub mod media;
+pub mod resampler;
 
 pub use dual_capture::{AudioSourceType, DualCapture, DualSamples, SourcedSample};
 

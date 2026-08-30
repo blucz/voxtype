@@ -24,9 +24,11 @@ enum CaptureCommand {
 struct StreamBuildParams {
     samples: Arc<Mutex<Vec<f32>>>,
     tx: mpsc::Sender<Vec<f32>>,
-    source_rate: u32,
-    target_rate: u32,
     source_channels: usize,
+    /// Shared with the capture thread so the tail can be flushed on stop.
+    /// The resampler lags its input by a chunk, so without this the last
+    /// ~21ms of every recording stays stuck in the delay line (#641).
+    resampler: Arc<Mutex<Option<super::resampler::StreamResampler>>>,
 }
 
 /// cpal-based audio capture implementation
@@ -200,13 +202,31 @@ impl AudioCapture for CpalCapture {
 
             let err_fn = |err| tracing::error!("Audio stream error: {}", err);
 
+            // One resampler for the life of the stream, shared with the stop
+            // path so its delay line can be drained.
+            let resampler: Arc<Mutex<Option<super::resampler::StreamResampler>>> =
+                Arc::new(Mutex::new(if source_sample_rate == target_sample_rate {
+                    None
+                } else {
+                    match super::resampler::StreamResampler::new(
+                        source_sample_rate,
+                        target_sample_rate,
+                    ) {
+                        Ok(r) => Some(r),
+                        Err(e) => {
+                            tracing::error!("{e}; capture will run without rate conversion");
+                            None
+                        }
+                    }
+                }));
+            let resampler_for_stop = resampler.clone();
+
             // Create the input stream based on sample format
             let make_params = || StreamBuildParams {
                 samples: samples_clone.clone(),
                 tx: chunk_tx.clone(),
-                source_rate: source_sample_rate,
-                target_rate: target_sample_rate,
                 source_channels,
+                resampler: resampler.clone(),
             };
 
             let stream_result = match sample_format {
@@ -246,6 +266,20 @@ impl AudioCapture for CpalCapture {
                     Ok(CaptureCommand::Stop(response_tx)) => {
                         // Stop the stream (drop it)
                         drop(stream);
+
+                        // Drain whatever the resampler still holds. Its delay
+                        // line is a chunk deep, so skipping this drops the end
+                        // of every recording.
+                        if let Ok(mut guard) = resampler_for_stop.lock() {
+                            if let Some(r) = guard.as_mut() {
+                                let tail = r.flush();
+                                if !tail.is_empty() {
+                                    if let Ok(mut s) = samples_clone.lock() {
+                                        s.extend_from_slice(&tail);
+                                    }
+                                }
+                            }
+                        }
 
                         // Get collected samples
                         let collected = {
@@ -361,9 +395,9 @@ where
     let StreamBuildParams {
         samples,
         tx,
-        source_rate,
-        target_rate,
         source_channels,
+        resampler,
+        ..
     } = params;
 
     let stream = device
@@ -382,11 +416,16 @@ where
                     })
                     .collect();
 
-                // Resample if needed
-                let resampled = if source_rate != target_rate {
-                    resample(&mono_f32, source_rate, target_rate)
-                } else {
-                    mono_f32
+                // Resample if needed. The resampler is stateful and lives as
+                // long as the stream: converting each callback independently
+                // reset the read position ~100 times a second and produced a
+                // discontinuity at every chunk boundary (#641).
+                let resampled = match resampler.lock() {
+                    Ok(mut r) => match r.as_mut() {
+                        Some(r) => r.push(&mono_f32),
+                        None => mono_f32,
+                    },
+                    Err(_) => mono_f32,
                 };
 
                 // Store samples
@@ -405,65 +444,44 @@ where
     Ok(stream)
 }
 
-/// Linear interpolation resampling
-/// For better quality, consider using the `rubato` crate
-fn resample(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
-    if from_rate == to_rate || samples.is_empty() {
-        return samples.to_vec();
-    }
-
-    let ratio = to_rate as f64 / from_rate as f64;
-    let new_len = (samples.len() as f64 * ratio).ceil() as usize;
-    let mut output = Vec::with_capacity(new_len);
-
-    for i in 0..new_len {
-        let src_idx = i as f64 / ratio;
-        let idx = src_idx.floor() as usize;
-        let frac = (src_idx - idx as f64) as f32;
-
-        let sample = if idx + 1 < samples.len() {
-            samples[idx] * (1.0 - frac) + samples[idx + 1] * frac
-        } else {
-            samples.get(idx).copied().unwrap_or(0.0)
-        };
-
-        output.push(sample);
-    }
-
-    output
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::super::resampler::resample_buffer;
+
+    // These moved off the removed linear-interpolation `resample()` and onto
+    // the band-limited path (#641). They cover very short inputs, which is a
+    // real case: a recording shorter than one FFT chunk still has to come out
+    // the other side.
 
     #[test]
     fn test_resample_same_rate() {
         let samples = vec![1.0, 2.0, 3.0, 4.0];
-        let result = resample(&samples, 16000, 16000);
+        let result = resample_buffer(&samples, 16000, 16000);
         assert_eq!(result, samples);
     }
 
     #[test]
     fn test_resample_downsample() {
         let samples = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
-        let result = resample(&samples, 48000, 16000);
-        // 48000 -> 16000 is 3:1 ratio, so 8 samples -> ~3 samples
-        assert!(result.len() >= 2 && result.len() <= 4);
+        let result = resample_buffer(&samples, 48000, 16000);
+        // 48000 -> 16000 is 3:1, so 8 samples land around 3.
+        assert!(
+            result.len() >= 2 && result.len() <= 4,
+            "expected about 3 samples, got {}",
+            result.len()
+        );
     }
 
     #[test]
     fn test_resample_upsample() {
         let samples = vec![1.0, 2.0];
-        let result = resample(&samples, 8000, 16000);
-        // 8000 -> 16000 is 1:2 ratio, so 2 samples -> 4 samples
+        let result = resample_buffer(&samples, 8000, 16000);
         assert_eq!(result.len(), 4);
     }
 
     #[test]
     fn test_resample_empty() {
         let samples: Vec<f32> = vec![];
-        let result = resample(&samples, 48000, 16000);
-        assert!(result.is_empty());
+        assert!(resample_buffer(&samples, 48000, 16000).is_empty());
     }
 }
