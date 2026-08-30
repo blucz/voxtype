@@ -390,6 +390,35 @@ impl DeviceManager {
     }
 }
 
+/// Reset hotkey tracking after an input-device change, returning the event the
+/// caller must send first.
+///
+/// Returns `Some(Released)` when the hotkey was held as the device list
+/// changed. Dropping that release strands the daemon mid-recording: the real
+/// key-up that follows is discarded by the `0 if is_pressed` guard, so nothing
+/// stops the recording and it runs to `max_duration_secs`.
+///
+/// Not a rare race. The recommended ydotool output driver creates a virtual
+/// keyboard on every paste, raising exactly this device-change event, so one
+/// dictation can arm the bug for the next (#556).
+fn reset_for_device_change(
+    is_pressed: &mut bool,
+    active_modifiers: &mut HashSet<Key>,
+    model_modifier_held: &mut bool,
+    held_profile_modifiers: &mut HashSet<Key>,
+    last_pressed_profile: &mut Option<String>,
+) -> Option<HotkeyEvent> {
+    let was_pressed = *is_pressed;
+
+    active_modifiers.clear();
+    *model_modifier_held = false;
+    held_profile_modifiers.clear();
+    *last_pressed_profile = None;
+    *is_pressed = false;
+
+    was_pressed.then_some(HotkeyEvent::Released)
+}
+
 /// Main listener loop running in a blocking task
 #[allow(clippy::too_many_arguments)]
 fn evdev_listener_loop(
@@ -456,12 +485,21 @@ fn evdev_listener_loop(
 
         // Check inotify for device changes
         if manager.check_for_device_changes() {
-            // Clear state when devices change
-            active_modifiers.clear();
-            model_modifier_held = false;
-            held_profile_modifiers.clear();
-            last_pressed_profile = None;
-            is_pressed = false;
+            if let Some(event) = reset_for_device_change(
+                &mut is_pressed,
+                &mut active_modifiers,
+                &mut model_modifier_held,
+                &mut held_profile_modifiers,
+                &mut last_pressed_profile,
+            ) {
+                tracing::warn!(
+                    "Input devices changed while the hotkey was held; releasing \
+                     so the recording does not run to the duration cap"
+                );
+                if tx.blocking_send(event).is_err() {
+                    return Ok(()); // Channel closed
+                }
+            }
             manager.handle_device_changes();
         }
 
@@ -788,6 +826,63 @@ fn parse_prefixed_keycode(s: &str) -> Result<Option<Key>, HotkeyError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #556: a device change while the hotkey is held must synthesize a
+    /// release. Without it the real key-up is dropped by the `0 if is_pressed`
+    /// guard and the recording runs to max_duration_secs — the reporter
+    /// measured 61% of recordings dropped and 9% hitting the cap.
+    #[test]
+    fn device_change_while_held_emits_release() {
+        let mut is_pressed = true;
+        let mut mods: HashSet<Key> = HashSet::from([Key::KEY_LEFTALT]);
+        let mut model_held = true;
+        let mut profile_mods: HashSet<Key> = HashSet::from([Key::KEY_LEFTSHIFT]);
+        let mut last_profile = Some("slack".to_string());
+
+        let event = reset_for_device_change(
+            &mut is_pressed,
+            &mut mods,
+            &mut model_held,
+            &mut profile_mods,
+            &mut last_profile,
+        );
+
+        assert!(
+            matches!(event, Some(HotkeyEvent::Released)),
+            "a held hotkey must be released when devices change"
+        );
+        // State is cleared either way.
+        assert!(!is_pressed);
+        assert!(mods.is_empty());
+        assert!(!model_held);
+        assert!(profile_mods.is_empty());
+        assert!(last_profile.is_none());
+    }
+
+    /// The common case: devices change while nothing is held. Emitting a
+    /// spurious release here would stop a recording the user never started.
+    #[test]
+    fn device_change_while_idle_emits_nothing() {
+        let mut is_pressed = false;
+        let mut mods: HashSet<Key> = HashSet::new();
+        let mut model_held = false;
+        let mut profile_mods: HashSet<Key> = HashSet::new();
+        let mut last_profile: Option<String> = None;
+
+        let event = reset_for_device_change(
+            &mut is_pressed,
+            &mut mods,
+            &mut model_held,
+            &mut profile_mods,
+            &mut last_profile,
+        );
+
+        assert!(
+            event.is_none(),
+            "idle device change must not emit a release"
+        );
+        assert!(!is_pressed);
+    }
 
     #[test]
     fn test_parse_key_name() {
