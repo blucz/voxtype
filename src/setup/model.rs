@@ -1228,23 +1228,40 @@ fn promote_part(part: &Path, dest: &Path) -> anyhow::Result<()> {
 /// bar, returning the path the bytes landed on. Cleans up on failure.
 ///
 /// The caller validates that path and then calls [`promote_part`].
+/// curl flags shared by both download paths.
+///
+/// `-C -` resumes from whatever the `.part` file already holds, which matters
+/// on the 2.4GB models where a dropped connection previously meant starting
+/// from zero. If the server ignores the Range request, curl restarts the
+/// transfer; a server that honours it wrongly is caught by the sha256 check
+/// against the manifest, which is why resuming is safe to do unconditionally.
+///
+/// `--speed-limit` / `--speed-time` abort a connection that goes quiet without
+/// closing, rather than hanging until the user notices (#645).
+const CURL_TRANSFER_ARGS: &[&str] = &[
+    "-L",
+    "--fail",
+    "-C",
+    "-",
+    "--speed-limit",
+    "1024",
+    "--speed-time",
+    "30",
+];
+
 fn curl_download(url: &str, dest: &Path) -> anyhow::Result<std::path::PathBuf> {
     let part = part_path(dest);
     let status = Command::new("curl")
-        .args([
-            "-L",
-            "--fail",
-            "--progress-bar",
-            "-o",
-            part.to_str().unwrap_or("file"),
-            url,
-        ])
+        .args(CURL_TRANSFER_ARGS)
+        .args(["--progress-bar", "-o", part.to_str().unwrap_or("file"), url])
         .status();
 
     match status {
         Ok(s) if s.success() => Ok(part),
         Ok(s) => {
-            let _ = std::fs::remove_file(&part);
+            // Deliberately keep the .part file: the next attempt resumes from
+            // it. A corrupt partial is caught by the sha256 check rather than
+            // by discarding progress on every hiccup.
             print_failure(&format!(
                 "Download failed: curl exited with code {}",
                 s.code().unwrap_or(-1)
@@ -1299,9 +1316,8 @@ fn download_to_part(
     let mut reporter = FileProgress::new(model, file, total);
 
     let mut child = Command::new("curl")
+        .args(CURL_TRANSFER_ARGS)
         .args([
-            "-L",
-            "--fail",
             "--silent",
             "--show-error",
             "-o",
