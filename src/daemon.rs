@@ -4111,21 +4111,34 @@ impl Daemon {
                     // Silently consume any stale cancel request
                     let _ = check_cancel_requested();
 
-                    // Periodically evict idle models (every ~60s when idle)
-                    // The check interval is 500ms, so we use a counter to approximate 60s
-                    static EVICTION_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-                    let count = EVICTION_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if count.is_multiple_of(120) {  // 500ms * 120 = 60s
-                        if let Some(ref mut mm) = self.model_manager {
-                            mm.evict_idle_models();
-                        }
-                    }
                 }
 
                 // === MEETING MODE HANDLERS ===
 
-                // Poll for meeting commands (file-based IPC)
+                // Poll for meeting commands (file-based IPC), and carry the
+                // idle model eviction that used to live on the 500ms idle arm.
+                //
+                // That arm never ran: select! drops and recreates its
+                // un-completed timer futures each iteration, so this
+                // unconditional 100ms sleep restarted the 500ms sleep before
+                // it could fire. #606 fixed the cancel-trigger half of that
+                // starvation; eviction was the other half, and it meant a
+                // daemon that loaded a model on demand never released it
+                // (#644).
                 _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                    // Evict roughly every 60s, and only while idle — unloading
+                    // a model out from under a recording would be worse than
+                    // holding it.
+                    static EVICTION_COUNTER: std::sync::atomic::AtomicU32 =
+                        std::sync::atomic::AtomicU32::new(0);
+                    let count =
+                        EVICTION_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if count.is_multiple_of(600) && matches!(state, State::Idle) {
+                        if let Some(ref mut mm) = self.model_manager {
+                            mm.evict_idle_models();
+                        }
+                    }
+
                     // Check for meeting start command
                     if let Some(trigger) = check_meeting_start() {
                         if self.config.meeting.enabled && self.meeting_daemon.is_none() {
