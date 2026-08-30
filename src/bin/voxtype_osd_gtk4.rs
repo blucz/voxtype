@@ -80,6 +80,21 @@ const RENDER_TICK_MS: u32 = 16;
 /// hiding the surface. Matches the BRIEF's "Idle: surface destroyed" rule.
 const IDLE_TIMEOUT_SECS: f32 = 0.15;
 
+/// True while the daemon has marked the in-flight recording as OSD-suppressed
+/// (`voxtype record start --no-osd`).
+///
+/// Frames stop flowing for a suppressed recording too, so the idle timeout
+/// alone would hide the surface. This is checked anyway so suppression is
+/// immediate rather than waiting out IDLE_TIMEOUT_SECS, and so the behaviour
+/// matches the Quickshell frontend exactly.
+fn osd_suppressed() -> bool {
+    let base = std::env::var("XDG_RUNTIME_DIR")
+        .unwrap_or_else(|_| format!("/run/user/{}", unsafe { libc::getuid() }));
+    std::path::Path::new(&base)
+        .join("voxtype/osd_suppressed")
+        .exists()
+}
+
 /// Number of segments in the vertical peak meter.
 const METER_SEGMENTS: usize = 10;
 
@@ -577,7 +592,7 @@ fn build_window(app: &Application, cfg: &OsdConfig, palette: Palette, state: Arc
 
         // A live session holds the surface up even with no frames yet.
         let starved = last_at.elapsed().as_secs_f32() > IDLE_TIMEOUT_SECS;
-        let idle = starved && !session_active.get();
+        let idle = (starved && !session_active.get()) || osd_suppressed();
 
         if idle {
             if visible.get() {

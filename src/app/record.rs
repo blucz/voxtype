@@ -111,6 +111,15 @@ pub(crate) fn send_record_command(
             .map_err(|e| anyhow::anyhow!("Failed to write shift_enter override: {}", e))?;
     }
 
+    // Write the OSD suppression sentinel if --no-osd was passed. Only written,
+    // never cleared here: like the other overrides the daemon consumes and
+    // removes it, so a stale file cannot silence a later recording.
+    if action.suppress_osd() {
+        let override_file = config::Config::runtime_dir().join("no_osd_override");
+        std::fs::write(&override_file, "true")
+            .map_err(|e| anyhow::anyhow!("Failed to write no_osd override: {}", e))?;
+    }
+
     // For toggle, we need to read current state to decide which signal to send
     let signal: libc::c_int = match &action {
         RecordAction::Start { .. } => libc::SIGUSR1,

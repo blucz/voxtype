@@ -57,6 +57,14 @@ pub enum RecordAction {
         #[arg(long, conflicts_with = "shift_enter_newlines")]
         no_shift_enter_newlines: bool,
 
+        /// Suppress the on-screen display for this recording only
+        ///
+        /// Leaves `osd.enabled` in config.toml untouched. Intended for external
+        /// tools that draw their own dictation UI and do not want voxtype's
+        /// overlay on top of it.
+        #[arg(long)]
+        no_osd: bool,
+
         /// Enable smart auto-submit for this recording (say "submit" to press Enter)
         #[arg(long, conflicts_with = "no_smart_auto_submit")]
         smart_auto_submit: bool,
@@ -146,6 +154,14 @@ pub enum RecordAction {
         /// Disable Shift+Enter newlines for this transcription (overrides config)
         #[arg(long, conflicts_with = "shift_enter_newlines")]
         no_shift_enter_newlines: bool,
+
+        /// Suppress the on-screen display for this recording only
+        ///
+        /// Leaves `osd.enabled` in config.toml untouched. Intended for external
+        /// tools that draw their own dictation UI and do not want voxtype's
+        /// overlay on top of it.
+        #[arg(long)]
+        no_osd: bool,
 
         /// Enable smart auto-submit for this recording (say "submit" to press Enter)
         #[arg(long, conflicts_with = "no_smart_auto_submit")]
@@ -274,6 +290,18 @@ impl RecordAction {
                 ..
             } => override_from_flags(*auto_submit, *no_auto_submit),
             RecordAction::Stop { .. } | RecordAction::Cancel { .. } => None,
+        }
+    }
+
+    /// Get the OSD suppression request from --no-osd.
+    ///
+    /// Returns true only when the flag is present; there is deliberately no
+    /// `--osd` counterpart, because "show the OSD" is already the config
+    /// default and a per-recording opt-in has no caller.
+    pub fn suppress_osd(&self) -> bool {
+        match self {
+            RecordAction::Start { no_osd, .. } | RecordAction::Toggle { no_osd, .. } => *no_osd,
+            RecordAction::Stop { .. } | RecordAction::Cancel => false,
         }
     }
 
@@ -765,6 +793,65 @@ mod tests {
         match cli.command {
             Some(Commands::Record { action }) => {
                 assert_eq!(action.auto_submit_override(), Some(true));
+            }
+            _ => panic!("Expected Record command"),
+        }
+    }
+
+    /// #636: --no-osd suppresses the OSD for one recording. Parsed on both
+    /// start and toggle, absent by default, and never claimed by stop/cancel
+    /// (the OSD decision belongs to the recording that opens the surface).
+    #[test]
+    fn test_record_no_osd_flag() {
+        for sub in ["start", "toggle"] {
+            let cli = Cli::parse_from(["voxtype", "record", sub, "--no-osd"]);
+            match cli.command {
+                Some(Commands::Record { action }) => {
+                    assert!(action.suppress_osd(), "--no-osd not honored on {}", sub);
+                }
+                _ => panic!("Expected Record command"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_record_no_osd_defaults_off() {
+        for args in [
+            vec!["voxtype", "record", "start"],
+            vec!["voxtype", "record", "toggle"],
+            vec!["voxtype", "record", "stop"],
+            vec!["voxtype", "record", "cancel"],
+        ] {
+            let cli = Cli::parse_from(args.clone());
+            match cli.command {
+                Some(Commands::Record { action }) => {
+                    assert!(
+                        !action.suppress_osd(),
+                        "unexpected suppression for {:?}",
+                        args
+                    );
+                }
+                _ => panic!("Expected Record command"),
+            }
+        }
+    }
+
+    /// The flag is orthogonal to the other per-recording overrides; combining
+    /// them must not disturb either.
+    #[test]
+    fn test_record_no_osd_composes_with_other_overrides() {
+        let cli = Cli::parse_from([
+            "voxtype",
+            "record",
+            "start",
+            "--no-osd",
+            "--no-auto-submit",
+            "--file",
+        ]);
+        match cli.command {
+            Some(Commands::Record { action }) => {
+                assert!(action.suppress_osd());
+                assert_eq!(action.auto_submit_override(), Some(false));
             }
             _ => panic!("Expected Record command"),
         }
