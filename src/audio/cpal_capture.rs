@@ -10,6 +10,7 @@ use super::AudioCapture;
 use crate::config::AudioConfig;
 use crate::error::AudioError;
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use tokio::sync::{mpsc, oneshot};
 
@@ -200,7 +201,20 @@ impl AudioCapture for CpalCapture {
                 buffer_size: cpal::BufferSize::Default,
             };
 
-            let err_fn = |err| tracing::error!("Audio stream error: {}", err);
+            // A stream error is terminal for that stream: cpal will deliver no
+            // further callbacks. Logging alone left capture silently dead
+            // until the daemon restarted, which is what a USB or Bluetooth
+            // microphone disconnect looks like in practice (#642).
+            //
+            // The flag is read by `is_stream_dead` so `start()` can rebuild
+            // rather than hand back a stream that will never produce a sample.
+            let stream_dead = Arc::new(AtomicBool::new(false));
+            let stream_dead_for_cb = stream_dead.clone();
+            let device_label = device_name.clone();
+            let err_fn = move |err| {
+                tracing::error!("Audio stream error, capture is now dead: {}", err);
+                stream_dead_for_cb.store(true, Ordering::SeqCst);
+            };
 
             // One resampler for the life of the stream, shared with the stop
             // path so its delay line can be drained.
@@ -266,6 +280,20 @@ impl AudioCapture for CpalCapture {
                     Ok(CaptureCommand::Stop(response_tx)) => {
                         // Stop the stream (drop it)
                         drop(stream);
+
+                        // A stream error is terminal: cpal stops delivering
+                        // callbacks, so whatever was captured before the error
+                        // is all there is. Saying so beats handing back a
+                        // truncated recording as though it were complete
+                        // (#642).
+                        if stream_dead.load(Ordering::SeqCst) {
+                            tracing::error!(
+                                "Audio device '{}' failed during this recording; \
+                                 the transcript will be short or empty. \
+                                 Reconnect the device and record again.",
+                                device_label
+                            );
+                        }
 
                         // Drain whatever the resampler still holds. Its delay
                         // line is a chunk deep, so skipping this drops the end
