@@ -67,16 +67,43 @@ pub struct StreamingSession {
     typed_chars: usize,
     /// Most recent partial text (for status only; never typed).
     partial: String,
+    /// When true, partial deltas are buffered for on-screen preview only
+    /// and never reach the cursor; the accumulated text is typed in one
+    /// burst when the backend finalizes. See [`StreamingSession::new_preview_only`].
+    preview_only: bool,
 }
 
 impl StreamingSession {
-    /// Create a new empty session.
+    /// Create a new empty session that types partial deltas live at the
+    /// cursor as they decode.
     pub fn new() -> Self {
         Self {
             finalized_text: String::new(),
             typed_chars: 0,
             partial: String::new(),
+            preview_only: false,
         }
+    }
+
+    /// Create a session that never types partials.
+    ///
+    /// Partial deltas accumulate in the buffer (which the daemon mirrors
+    /// to the OSD preview file) and the whole accumulated utterance is
+    /// typed in a single burst when the backend finalizes. This is the
+    /// policy the daemon uses: a revision-style backend can rewrite its
+    /// partials freely without the user ever seeing wrong text land in
+    /// their editor, and one burst at the end avoids interleaving typed
+    /// characters with whatever else has focus.
+    pub fn new_preview_only() -> Self {
+        Self {
+            preview_only: true,
+            ..Self::new()
+        }
+    }
+
+    /// Whether this session withholds partials from the cursor.
+    pub fn is_preview_only(&self) -> bool {
+        self.preview_only
     }
 
     /// Update the in-memory partial text. Returns the new partial for
@@ -108,6 +135,15 @@ impl StreamingSession {
         post_output_command: Option<&str>,
     ) -> Result<(), OutputError> {
         if new_partial.is_empty() {
+            return Ok(());
+        }
+
+        // Preview-only: buffer the delta for display and leave the cursor
+        // untouched. `typed_chars` deliberately does not move — nothing
+        // was typed, so a cancel-rewind must not backspace over text the
+        // user's editor never received.
+        if self.preview_only {
+            self.partial.push_str(&new_partial);
             return Ok(());
         }
 
@@ -167,6 +203,26 @@ impl StreamingSession {
         pre_output_command: Option<&str>,
         post_output_command: Option<&str>,
     ) -> Result<(), OutputError> {
+        // In preview-only mode the buffered partial has not reached the
+        // cursor yet, so the burst to type is the whole accumulated
+        // utterance: every withheld delta plus this final tail. An empty
+        // `text` is therefore still meaningful here — it means "finalize
+        // what you were holding" — so the early return must not fire
+        // until the buffer is drained too.
+        let owned;
+        let text: &str = if self.preview_only {
+            if self.partial.is_empty() && text.is_empty() {
+                return Ok(());
+            }
+            owned = format!("{}{}", self.partial, text);
+            // The buffer is now represented by `text`; clear it so the
+            // accounting below doesn't count it a second time.
+            self.partial.clear();
+            &owned
+        } else {
+            text
+        };
+
         if text.is_empty() {
             self.clear_partial();
             return Ok(());
@@ -215,6 +271,23 @@ impl StreamingSession {
         pre_output_command: Option<&str>,
         post_output_command: Option<&str>,
     ) -> Result<(), OutputError> {
+        // Preview-only: the buffered partial never reached the cursor, so
+        // a revision over it is a pure buffer edit — no key events. Only
+        // a backspace count that runs *past* the buffer reaches text a
+        // previous Final really typed, and that remainder still needs
+        // real BackSpace events.
+        let backspace = if self.preview_only {
+            let buffered = self.partial.chars().count();
+            let absorbed = backspace.min(buffered);
+            if absorbed > 0 {
+                let keep = buffered - absorbed;
+                self.partial = self.partial.chars().take(keep).collect();
+            }
+            backspace - absorbed
+        } else {
+            backspace
+        };
+
         // Cap backspace at what we've actually typed.
         let n = backspace.min(self.typed_chars);
         if n > 0 {
@@ -238,6 +311,18 @@ impl StreamingSession {
                 self.typed_chars = self.typed_chars.saturating_sub(emitted);
             }
         }
+
+        // Same flush rule as commit_segment: in preview-only mode the
+        // buffered (post-truncation) text has not been typed yet, so it
+        // rides along with this revision.
+        let owned;
+        let text: &str = if self.preview_only {
+            owned = format!("{}{}", self.partial, text);
+            self.partial.clear();
+            &owned
+        } else {
+            text
+        };
 
         if !text.is_empty() {
             let opts = OutputOptions {
@@ -505,5 +590,131 @@ mod tests {
         // Should succeed without spawning anything.
         session.rewind().await.unwrap();
         assert_eq!(session.typed_chars(), 0);
+    }
+
+    // ---- preview-only policy ----
+
+    #[tokio::test]
+    async fn preview_only_withholds_partials_from_the_cursor() {
+        let out = std::sync::Arc::new(RecordingOutput::new());
+        let chain = chain_with(out.clone());
+        let mut s = StreamingSession::new_preview_only();
+
+        s.type_partial_delta(&chain, "hello ".into(), None, None)
+            .await
+            .unwrap();
+        s.type_partial_delta(&chain, "world".into(), None, None)
+            .await
+            .unwrap();
+
+        // Nothing typed, but the buffer holds the full preview text.
+        assert!(out.typed().is_empty(), "partials must not reach the cursor");
+        assert_eq!(s.partial(), "hello world");
+        // Critically: typed_chars stays 0, so a cancel cannot backspace
+        // over characters the editor never received.
+        assert_eq!(s.typed_chars(), 0);
+    }
+
+    #[tokio::test]
+    async fn preview_only_types_whole_utterance_on_final() {
+        let out = std::sync::Arc::new(RecordingOutput::new());
+        let chain = chain_with(out.clone());
+        let mut s = StreamingSession::new_preview_only();
+
+        s.type_partial_delta(&chain, "hello ".into(), None, None)
+            .await
+            .unwrap();
+        s.commit_segment(&chain, "world", None, None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(out.typed(), vec!["hello world".to_string()]);
+        assert_eq!(s.finalized_text(), "hello world");
+        assert_eq!(s.typed_chars(), "hello world".chars().count());
+        assert_eq!(s.partial(), "");
+    }
+
+    #[tokio::test]
+    async fn preview_only_final_flushes_buffer_even_with_empty_tail() {
+        // ParakeetUnified::flush() can return nothing when the last chunk
+        // already emitted everything. The buffered deltas must still be
+        // typed rather than silently dropped.
+        let out = std::sync::Arc::new(RecordingOutput::new());
+        let chain = chain_with(out.clone());
+        let mut s = StreamingSession::new_preview_only();
+
+        s.type_partial_delta(&chain, "buffered text".into(), None, None)
+            .await
+            .unwrap();
+        s.commit_segment(&chain, "", None, None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(out.typed(), vec!["buffered text".to_string()]);
+        assert_eq!(s.finalized_text(), "buffered text");
+    }
+
+    #[tokio::test]
+    async fn preview_only_no_op_when_nothing_buffered_or_final() {
+        let out = std::sync::Arc::new(RecordingOutput::new());
+        let chain = chain_with(out.clone());
+        let mut s = StreamingSession::new_preview_only();
+
+        s.commit_segment(&chain, "", None, None, None)
+            .await
+            .unwrap();
+        assert!(out.typed().is_empty());
+        assert_eq!(s.typed_chars(), 0);
+    }
+
+    #[tokio::test]
+    async fn preview_only_revision_edits_buffer_without_backspaces() {
+        let out = std::sync::Arc::new(RecordingOutput::new());
+        let chain = chain_with(out.clone());
+        let mut s = StreamingSession::new_preview_only();
+
+        s.type_partial_delta(&chain, "recognise".into(), None, None)
+            .await
+            .unwrap();
+        // Backend revises the last 3 chars ("ise" -> "ize") and finalizes.
+        s.replace_and_commit(&chain, 3, "ize", None, None)
+            .await
+            .unwrap();
+
+        // One clean burst; the revision never reached the cursor, so no
+        // backspaces were needed.
+        assert_eq!(out.typed(), vec!["recognize".to_string()]);
+        assert_eq!(s.finalized_text(), "recognize");
+    }
+
+    #[tokio::test]
+    async fn live_mode_still_types_partials() {
+        // The non-preview policy must be untouched by the preview work.
+        let out = std::sync::Arc::new(RecordingOutput::new());
+        let chain = chain_with(out.clone());
+        let mut s = StreamingSession::new();
+
+        s.type_partial_delta(&chain, "live ".into(), None, None)
+            .await
+            .unwrap();
+        assert_eq!(out.typed(), vec!["live ".to_string()]);
+        assert_eq!(s.typed_chars(), 5);
+        assert!(!s.is_preview_only());
+    }
+
+    #[tokio::test]
+    async fn preview_only_counts_unicode_scalars_not_bytes() {
+        let out = std::sync::Arc::new(RecordingOutput::new());
+        let chain = chain_with(out.clone());
+        let mut s = StreamingSession::new_preview_only();
+
+        s.type_partial_delta(&chain, "café ".into(), None, None)
+            .await
+            .unwrap();
+        s.commit_segment(&chain, "naïve", None, None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(s.typed_chars(), "café naïve".chars().count());
     }
 }

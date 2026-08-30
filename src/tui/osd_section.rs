@@ -27,6 +27,7 @@ pub struct OsdState {
     pub palette: String,
     pub layout: String,
     pub position: String,
+    pub visual_mode: String,
     pub width_px: i64,
     pub height_px: i64,
     pub margin_px: i64,
@@ -53,6 +54,7 @@ pub enum Field {
     Palette,
     Layout,
     Position,
+    VisualMode,
     WidthPx,
     HeightPx,
     MarginPx,
@@ -71,6 +73,7 @@ impl Field {
         Field::Palette,
         Field::Layout,
         Field::Position,
+        Field::VisualMode,
         Field::WidthPx,
         Field::HeightPx,
         Field::MarginPx,
@@ -88,6 +91,7 @@ const FRONTEND_CHOICES: &[&str] = &["gtk4", "native", "quickshell"];
 const STYLE_CHOICES: &[&str] = &["default"];
 const PALETTE_CHOICES: &[&str] = &["auto", "omarchy", "fallback", "package", "custom"];
 const LAYOUT_CHOICES: &[&str] = &["compact", "wide", "minimal", "tile", "orb", "custom"];
+const VISUAL_MODE_CHOICES: &[&str] = &["waveform", "text", "pill"];
 const POSITION_CHOICES: &[&str] = &[
     "bottom-center",
     "top-center",
@@ -131,6 +135,9 @@ impl OsdState {
             position: ed
                 .get_string(TABLE, "position")
                 .unwrap_or_else(|| "bottom-center".to_string()),
+            visual_mode: ed
+                .get_string(TABLE, "visual_mode")
+                .unwrap_or_else(|| "waveform".to_string()),
             width_px: ed.get_int(TABLE, "width_px").unwrap_or(400),
             height_px: ed.get_int(TABLE, "height_px").unwrap_or(48),
             margin_px: ed.get_int(TABLE, "margin_px").unwrap_or(24),
@@ -164,6 +171,7 @@ impl OsdState {
         }
         ed.set_string(TABLE, "layout", &self.layout);
         ed.set_string(TABLE, "position", &self.position);
+        ed.set_string(TABLE, "visual_mode", &self.visual_mode);
         ed.set_int(TABLE, "width_px", self.width_px);
         ed.set_int(TABLE, "height_px", self.height_px);
         ed.set_int(TABLE, "margin_px", self.margin_px);
@@ -219,6 +227,9 @@ impl OsdState {
             Field::Palette => self.palette = cycle_str(PALETTE_CHOICES, &self.palette, delta),
             Field::Layout => self.layout = cycle_str(LAYOUT_CHOICES, &self.layout, delta),
             Field::Position => self.position = cycle_str(POSITION_CHOICES, &self.position, delta),
+            Field::VisualMode => {
+                self.visual_mode = cycle_str(VISUAL_MODE_CHOICES, &self.visual_mode, delta)
+            }
             Field::WidthPx => self.width_px = cycle_int(WIDTH_CHOICES, self.width_px, delta),
             Field::HeightPx => self.height_px = cycle_int(HEIGHT_CHOICES, self.height_px, delta),
             Field::MarginPx => self.margin_px = cycle_int(MARGIN_CHOICES, self.margin_px, delta),
@@ -353,6 +364,11 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
             state.field == Field::Position,
             "Position",
             state.position.clone(),
+        ),
+        FormRowSpec::new(
+            state.field == Field::VisualMode,
+            "Visual mode",
+            state.visual_mode.clone(),
         ),
         FormRowSpec::new(
             state.field == Field::WidthPx,
@@ -514,6 +530,24 @@ fn guidance_for_field(state: &OsdState) -> Vec<Line<'_>> {
             Line::from("  top-center"),
             Line::from("  bottom-left, bottom-right"),
             Line::from("  top-left, top-right"),
+        ],
+        Field::VisualMode => vec![
+            heading("Visual mode"),
+            Line::from(""),
+            Line::from("What the gtk4 panel draws while a session is active."),
+            Line::from(""),
+            Line::from("  waveform  scrolling envelope + peak meter (default)"),
+            Line::from("  text      live transcript preview, VoiceInk style"),
+            Line::from("  pill      thin amplitude capsule, no motion"),
+            Line::from(""),
+            Line::from(
+                "text needs a streaming engine — set [parakeet] streaming = true \
+                 with a streaming-capable model. Without published transcript \
+                 text it renders the pill instead. In text mode the panel also \
+                 grows to 560x132 unless Width/Height were set explicitly.",
+            ),
+            Line::from(""),
+            Line::from("Quickshell ignores this; it uses [[osd.visual.layers]]."),
         ],
         Field::WidthPx => vec![
             heading("Width (px)"),

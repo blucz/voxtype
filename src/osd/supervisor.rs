@@ -55,11 +55,17 @@ fn resolve_osd_binary() -> PathBuf {
 /// Spawn a tokio task that supervises `voxtype-osd`. The returned handle's
 /// drop kills the child via `kill_on_drop`. Holding the handle keeps the
 /// supervisor alive for the daemon's lifetime.
-pub fn spawn() -> JoinHandle<()> {
-    tokio::spawn(supervise())
+/// `config_path` is the config file the daemon itself was started with
+/// (`voxtype -c <path> daemon`). It is forwarded to the child so the OSD
+/// renders the same `[osd]` section the daemon parsed. Without it the
+/// frontend silently falls back to `~/.config/voxtype/config.toml`, so a
+/// daemon run against any other config got an OSD configured from a
+/// different file.
+pub fn spawn(config_path: Option<PathBuf>) -> JoinHandle<()> {
+    tokio::spawn(supervise(config_path))
 }
 
-async fn supervise() {
+async fn supervise(config_path: Option<PathBuf>) {
     let mut backoff = RESTART_MIN;
     let mut rapid_fails: u32 = 0;
     let mut rapid_window_start = Instant::now();
@@ -74,6 +80,11 @@ async fn supervise() {
         // the Quickshell launcher (otherwise kill_on_drop has nothing
         // to kill — see #395).
         cmd.env("VOXTYPE_OSD_SUPERVISED", "1");
+        // Both the dispatcher and every frontend read this via clap's
+        // `env = "VOXTYPE_CONFIG"`, so one variable covers all of them.
+        if let Some(path) = &config_path {
+            cmd.env("VOXTYPE_CONFIG", path);
+        }
 
         let mut child = match cmd.spawn() {
             Ok(c) => c,

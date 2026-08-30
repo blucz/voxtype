@@ -207,6 +207,11 @@ PanelWindow {
         if ((position === "bottom-left") || (position === "bottom-right")) {
             return Math.max(margin, panel.height - _cardHeight() - margin);
         }
+        // top-center pins to the top edge by the absolute pixel margin.
+        // Letting it fall through to the fractional top_margin below
+        // offsets it by 0.85 x screen height, i.e. renders it at the
+        // bottom, indistinguishable from bottom-center.
+        if (position === "top-center") return margin;
         const y = panel.height * _styleTopMargin();
         return Math.max(margin, Math.min(panel.height - _cardHeight() - margin, y));
     }

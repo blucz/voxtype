@@ -295,6 +295,15 @@ on_transcription = true
 # - quickshell: QML frontend with recipe/style customization
 frontend = "gtk4"
 
+# What the panel draws while a session is active (gtk4 frontend).
+# - waveform: scrolling waveform + segmented peak meter (default)
+# - text:     live transcript preview, VoiceInk style. Needs a streaming
+#             engine (e.g. [parakeet] streaming = true); falls back to the
+#             pill whenever no transcript is being published.
+# - pill:     a thin amplitude capsule, no scrolling motion
+# The Quickshell frontend uses [[osd.visual.layers]] below instead.
+visual_mode = "waveform"
+
 # Quickshell style customization. These fields are ignored by gtk4/native.
 # style can be "default", an installed package name, or a package path.
 style = "default"

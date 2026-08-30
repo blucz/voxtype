@@ -21,6 +21,46 @@ pub enum OsdPosition {
     TopRight,
 }
 
+/// What the OSD surface draws while a session is active.
+///
+/// `Waveform` is the historical behaviour (scrolling envelope + segmented
+/// peak meter). The other two exist because a moving waveform is a poor
+/// fit for dictation: it is motion in the user's peripheral vision that
+/// carries almost no actionable information.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OsdVisualMode {
+    /// Scrolling waveform plus segmented peak meter.
+    #[default]
+    Waveform,
+    /// Live decoded-transcript preview, VoiceInk style. Requires a
+    /// streaming-capable engine; falls back to [`OsdVisualMode::Pill`]
+    /// rendering whenever no preview text is being published.
+    Text,
+    /// A thin amplitude capsule. Conveys "the mic hears you" with a
+    /// single quiet quantity and no scrolling motion.
+    Pill,
+}
+
+impl OsdVisualMode {
+    pub fn parse_str(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "waveform" | "wave" => Some(OsdVisualMode::Waveform),
+            "text" | "transcript" | "preview" => Some(OsdVisualMode::Text),
+            "pill" | "bar" | "amplitude" => Some(OsdVisualMode::Pill),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            OsdVisualMode::Waveform => "waveform",
+            OsdVisualMode::Text => "text",
+            OsdVisualMode::Pill => "pill",
+        }
+    }
+}
+
 /// Selects which OSD frontend the `voxtype-osd` wrapper launches.
 ///
 /// The wrapper treats this as a *preference*: if the chosen frontend's
@@ -352,6 +392,11 @@ pub struct OsdConfig {
     /// Quickshell host-frame styling for no-code recipes.
     pub frame: OsdFrameConfig,
     /// Declarative no-code visual recipe for the Quickshell OSD.
+    /// What the surface draws while active: `waveform` (default),
+    /// `text` (live transcript preview), or `pill` (thin amplitude
+    /// capsule). Honoured by the GTK4 frontend; the Quickshell frontend
+    /// uses the richer `[[osd.visual.layers]]` recipe system instead.
+    pub visual_mode: OsdVisualMode,
     pub visual: OsdVisualConfig,
 }
 
@@ -374,6 +419,7 @@ impl Default for OsdConfig {
             layout: OsdLayout::default(),
             plugin_path: None,
             frame: OsdFrameConfig::default(),
+            visual_mode: OsdVisualMode::default(),
             visual: OsdVisualConfig::default(),
         }
     }

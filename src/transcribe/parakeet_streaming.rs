@@ -22,8 +22,10 @@
 //! pipeline (that lives in the multitalker / EOU model). Until we add VAD-
 //! based segmentation, this implementation:
 //!
-//! - emits one [`StreamingEvent::Partial`] per audio chunk with the
-//!   *cumulative* transcript so far;
+//! - emits one [`StreamingEvent::Partial`] per audio chunk carrying only
+//!   that chunk's newly-decoded text (a *delta*, not a cumulative
+//!   transcript — `ParakeetUnified::transcribe_chunk` returns just the
+//!   tail it emitted for the samples it was handed);
 //! - emits exactly one [`StreamingEvent::Final`] with the flushed text on
 //!   stream close (samples sender dropped or cancel signal);
 //! - emits exactly one [`StreamingEvent::Ended`] last.
@@ -118,10 +120,18 @@ impl ParakeetStreamingTranscriber {
         .validate()
         .map_err(|e| {
             TranscribeError::InitFailed(format!(
-                "Invalid Parakeet streaming config: {}. \
-                Check streaming_chunk_secs, streaming_left_context_secs, \
-                streaming_right_context_secs in [parakeet].",
-                e
+                "Invalid Parakeet streaming config: {}\n\n\
+                The cache-aware pipeline needs each streaming window to land \
+                on a mel-frame count divisible by 8, which at the 10 ms feature \
+                hop means every one of these must be a multiple of 0.08 s:\n\n  \
+                streaming_chunk_secs         = {:.2}\n  \
+                streaming_left_context_secs  = {:.2}\n  \
+                streaming_right_context_secs = {:.2}\n\n\
+                Valid nearby values: 0.16, 0.24, 0.32, 0.48, 0.8, 1.6.",
+                e,
+                config.streaming_chunk_secs,
+                config.streaming_left_context_secs,
+                config.streaming_right_context_secs,
             ))
         })?;
 
@@ -230,7 +240,10 @@ impl StreamingTranscriber for ParakeetStreamingTranscriber {
 
                 let chunk = match runtime.block_on(samples_rx.recv()) {
                     Some(c) => c,
-                    None => break, // graceful EOF
+                    None => {
+                        tracing::debug!("Parakeet streaming: sample channel closed (EOF)");
+                        break; // graceful EOF
+                    }
                 };
 
                 if chunk.is_empty() {
@@ -250,7 +263,13 @@ impl StreamingTranscriber for ParakeetStreamingTranscriber {
                     }
                 };
 
-                if text != last_text {
+                // `transcribe_chunk` yields a delta, so every non-empty
+                // result is new text and must be forwarded. Suppressing
+                // deltas equal to the previous one — as this did before —
+                // silently swallowed legitimately repeated words: saying
+                // "very very" or "that that" decoded two identical
+                // deltas and only the first survived.
+                if !text.is_empty() {
                     last_text = text.clone();
                     let _ = runtime
                         .block_on(events_tx.send(StreamingEvent::Partial { text, segment_id }));
@@ -258,6 +277,7 @@ impl StreamingTranscriber for ParakeetStreamingTranscriber {
             }
 
             // Drain any buffered audio with flush() on close.
+            tracing::debug!("Parakeet streaming: flushing");
             let final_text = match unified.flush() {
                 Ok(t) => t.trim().to_string(),
                 Err(e) => {
@@ -266,6 +286,10 @@ impl StreamingTranscriber for ParakeetStreamingTranscriber {
                 }
             };
 
+            tracing::debug!(
+                final_len = final_text.len(),
+                "Parakeet streaming: flush complete, emitting Final+Ended"
+            );
             if !final_text.is_empty() {
                 let _ = runtime.block_on(events_tx.send(StreamingEvent::Final {
                     text: final_text,

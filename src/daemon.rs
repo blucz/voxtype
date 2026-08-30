@@ -1056,9 +1056,20 @@ impl Daemon {
             return false;
         }
 
+        // Publish the empty preview *before* opening the capture device.
+        // The OSD treats the file's presence as "session live" and maps its
+        // surface on the next poll, so the panel is up while PipeWire is
+        // still handing us a stream — that open costs a few hundred ms, and
+        // waiting for the first audio frame is what made the OSD look laggy.
+        // Both failure paths below clear it again.
+        self.publish_preview("");
+
         let (capture, samples_rx) = match self.start_streaming_capture().await {
             Ok(v) => v,
-            Err(()) => return false,
+            Err(()) => {
+                self.clear_preview();
+                return false;
+            }
         };
 
         let streaming = transcriber.as_streaming().expect("checked above");
@@ -1067,6 +1078,7 @@ impl Daemon {
             Err(e) => {
                 tracing::error!("Failed to start streaming session: {}", e);
                 self.play_feedback(SoundEvent::Error);
+                self.clear_preview();
                 // Drop the capture cleanly; ignore final samples.
                 let mut c = capture;
                 let _ = c.stop().await;
@@ -1076,7 +1088,7 @@ impl Daemon {
 
         *audio_capture = Some(capture);
         *streaming_handle = Some(handle);
-        *streaming_session = Some(StreamingSession::new());
+        *streaming_session = Some(StreamingSession::new_preview_only());
         *streaming_chain = Some(output::create_output_chain(&self.config.output));
         *state = State::Streaming {
             started_at: std::time::Instant::now(),
@@ -1123,6 +1135,30 @@ impl Daemon {
         if let Some(hub) = &self.level_hub {
             self.streaming_drain_pump = Some(audio::levels::spawn_silence_pump(hub.frame_sink()));
         }
+    }
+
+    /// Mirror the live transcript to the OSD preview file.
+    ///
+    /// Best-effort and non-fatal: the preview is a display affordance, so
+    /// a failed write must never disturb transcription. Skipped entirely
+    /// when the OSD is disabled so we do no filesystem work for a surface
+    /// nobody is rendering.
+    fn publish_preview(&self, text: &str) {
+        if !self.config.osd.enabled {
+            return;
+        }
+        let path = crate::osd::preview::default_preview_path();
+        if let Err(e) = crate::osd::preview::write_preview(&path, text) {
+            tracing::debug!("Failed to publish OSD preview: {}", e);
+        }
+    }
+
+    /// Remove the preview file, telling the OSD the session is over.
+    fn clear_preview(&self) {
+        if !self.config.osd.enabled {
+            return;
+        }
+        crate::osd::preview::clear_preview(&crate::osd::preview::default_preview_path());
     }
 
     /// Cut audio flow to the streaming backend immediately. Aborts the
@@ -1175,9 +1211,46 @@ impl Daemon {
             // completed. We drop events implicitly here.
             let _ = h.task.await;
         }
+
+        // Commit anything still sitting in a preview-only buffer.
+        //
+        // A preview-only session holds the whole utterance in memory until
+        // something finalizes it, and backends are not obliged to send a
+        // Final: `ParakeetUnified::flush()` returns an empty tail whenever
+        // the last chunk already emitted everything it had, and the backend
+        // skips the Final event entirely in that case. Without this, every
+        // recording that happened to end on a chunk boundary would type
+        // nothing at all and silently discard the transcript the user just
+        // watched appear on screen.
+        //
+        // Events are FIFO, so a real Final has already been committed by the
+        // event pump before Ended got here — which leaves the buffer empty
+        // and makes this a no-op in the common path.
+        if let (Some(s), Some(chain)) = (streaming_session.as_mut(), streaming_chain.as_ref()) {
+            if s.is_preview_only() && !s.partial().is_empty() {
+                tracing::debug!(
+                    buffered = s.partial().len(),
+                    "Committing buffered transcript at stream end (backend sent no Final)"
+                );
+                if let Err(e) = s
+                    .commit_segment(
+                        chain,
+                        "",
+                        self.post_processor.as_ref(),
+                        self.config.output.pre_output_command.as_deref(),
+                        self.config.output.post_output_command.as_deref(),
+                    )
+                    .await
+                {
+                    tracing::error!("Streaming end-of-stream commit failed: {}", e);
+                }
+            }
+        }
+
         self.stop_streaming_drain_pump();
         *streaming_session = None;
         *streaming_chain = None;
+        self.clear_preview();
 
         self.play_feedback(SoundEvent::TranscriptionComplete);
 
@@ -1224,6 +1297,7 @@ impl Daemon {
         self.stop_streaming_drain_pump();
         *streaming_session = None;
         *streaming_chain = None;
+        self.clear_preview();
 
         cleanup_output_mode_override();
         cleanup_model_override();
@@ -2542,6 +2616,10 @@ impl Daemon {
     pub async fn run(&mut self) -> Result<()> {
         tracing::info!("Starting voxtype daemon");
 
+        // Drop any preview left behind by a previous run that was killed
+        // mid-session, so the first recording never flashes stale text.
+        self.clear_preview();
+
         // Engine-vs-binary mismatch check at startup so users see a desktop
         // notification before the first transcription attempt would fail.
         // create_transcriber() below will surface the same error in logs,
@@ -2622,7 +2700,8 @@ impl Daemon {
         // the socket the frontend has nothing to render, so skip the spawn
         // rather than burning a slot in the launcher's restart logic.
         if self.config.osd.enabled && self.level_hub.is_some() {
-            self.osd_supervisor_task = Some(crate::osd::supervisor::spawn());
+            self.osd_supervisor_task =
+                Some(crate::osd::supervisor::spawn(self.config_path.clone()));
         }
 
         // Check if another instance is already running (single-instance safeguard)
@@ -3362,6 +3441,28 @@ impl Daemon {
                     if check_cancel_requested() {
                         tracing::info!("Recording cancelled");
 
+                        // A streaming session owns a backend task, an output
+                        // session and the OSD preview file. Unwinding it by
+                        // hand here leaks all three: the event-pump arm is
+                        // gated on `state.is_streaming()`, so the moment this
+                        // block sets Idle the backend's Final/Ended events
+                        // stop being drained and `end_streaming` never runs —
+                        // leaving a stale transcript on screen. Delegate to
+                        // the streaming teardown, which performs the same
+                        // override cleanup, feedback, hook and notification
+                        // this block does.
+                        if state.is_streaming() {
+                            self.cancel_streaming_to_idle(
+                                &mut state,
+                                &mut audio_capture,
+                                &mut streaming_handle,
+                                &mut streaming_session,
+                                &mut streaming_chain,
+                                "Recording discarded",
+                            ).await;
+                            continue;
+                        }
+
                         // Stop recording and discard audio
                         if let Some(mut capture) = audio_capture.take() {
                             let _ = capture.stop().await;
@@ -3684,16 +3785,36 @@ impl Daemon {
                 _ = sigusr2.recv() => {
                     tracing::debug!("Received SIGUSR2 (stop recording)");
                     if state.is_streaming() {
-                        tracing::info!("SIGUSR2 stop while streaming; closing capture and disowning session");
+                        // Close the mic, then let the backend drain.
                         self.stop_streaming_capture(&mut audio_capture).await;
-                        // Drop the typing surface synchronously so any
-                        // Final/Partial events the backend emits while
-                        // draining its internal buffer reach the event-pump
-                        // arm with `streaming_session = None` and get
-                        // discarded instead of typed into whatever window
-                        // has focus by then.
-                        streaming_session = None;
-                        streaming_chain = None;
+
+                        // Whether the session survives the stop depends on
+                        // which output policy it is running.
+                        //
+                        // Live-typing sessions have already typed everything
+                        // the user said, so a Final arriving during the drain
+                        // would type a *duplicate* into whatever holds focus
+                        // by then. Those get disowned here.
+                        //
+                        // Preview-only sessions have typed nothing at all —
+                        // the transcript exists solely in the session buffer,
+                        // and the Final that ends the drain is what commits
+                        // it. Disowning one throws the whole utterance away.
+                        let disown = streaming_session
+                            .as_ref()
+                            .map(|s| !s.is_preview_only())
+                            .unwrap_or(true);
+                        if disown {
+                            tracing::info!(
+                                "SIGUSR2 stop while streaming; closing capture and disowning session"
+                            );
+                            streaming_session = None;
+                            streaming_chain = None;
+                        } else {
+                            tracing::info!(
+                                "SIGUSR2 stop while streaming; draining backend to commit buffered transcript"
+                            );
+                        }
                     } else if let State::Recording { model_override, .. } = &state {
                         let model_override = model_override.clone();
 
@@ -3785,8 +3906,16 @@ impl Daemon {
                                 ).await {
                                     tracing::warn!("Streaming partial delta type failed: {}", e);
                                 }
-                                if let State::Streaming { typed_chars, .. } = &mut state {
+                                // The session is preview-only, so this
+                                // buffered text is the *only* place the
+                                // user can see the decode so far. Mirror
+                                // finalized-plus-buffered to the OSD.
+                                let preview = format!("{}{}", s.finalized_text(), s.partial());
+                                self.publish_preview(&preview);
+                                if let State::Streaming { typed_chars, partial_buffer, .. } = &mut state {
                                     *typed_chars = s.typed_chars();
+                                    partial_buffer.clear();
+                                    partial_buffer.push_str(s.partial());
                                 }
                             }
                         }
@@ -3804,11 +3933,13 @@ impl Daemon {
                                 ).await {
                                     tracing::error!("Streaming commit_segment failed: {}", e);
                                 }
+                                self.publish_preview(s.finalized_text());
                                 // Mirror typed_chars onto the state for cancel-rewind.
-                                if let State::Streaming { typed_chars, finalized_text, .. } = &mut state {
+                                if let State::Streaming { typed_chars, finalized_text, partial_buffer, .. } = &mut state {
                                     *typed_chars = s.typed_chars();
                                     finalized_text.clear();
                                     finalized_text.push_str(s.finalized_text());
+                                    partial_buffer.clear();
                                 }
                             }
                         }

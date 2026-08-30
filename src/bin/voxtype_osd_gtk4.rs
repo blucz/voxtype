@@ -29,8 +29,9 @@ use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 
 use voxtype::audio::levels::{AudioFrame, FRAME_HZ};
 use voxtype::config::Config as VoxtypeConfig;
-use voxtype::osd::config::{OsdConfig, OsdPosition};
+use voxtype::osd::config::{OsdConfig, OsdPosition, OsdVisualMode};
 use voxtype::osd::ipc::{resolve_socket_path, run_ipc_loop, FrameRing, DEFAULT_RING_DEPTH};
+use voxtype::osd::preview::{default_preview_path, read_preview, PREVIEW_POLL_MS};
 use voxtype::osd::theme::ThemeWatcher;
 use voxtype::osd::visual::{peak_meter_fraction, project_envelope, MeterZone, Palette, PeakHold};
 
@@ -82,6 +83,25 @@ const METER_SEGMENTS: usize = 10;
 
 /// dBFS floor for the peak meter (maps to "empty bar").
 const METER_FLOOR_DBFS: f32 = -60.0;
+
+/// Preview text point size, and the line box as a multiple of it.
+const PREVIEW_FONT_SIZE: f64 = 15.0;
+const PREVIEW_LINE_FACTOR: f64 = 1.38;
+
+/// Inner padding of the text/pill panels, in pixels.
+const PANEL_PAD_X: f64 = 16.0;
+const PANEL_PAD_Y: f64 = 12.0;
+
+/// Corner radius for the text/pill panels.
+const PANEL_RADIUS: f64 = 12.0;
+
+/// Surface size used by `visual_mode = "text"` when the user has not
+/// chosen one. A 400x48 strip fits a waveform but only one short line of
+/// transcript, so text mode substitutes a panel proportioned for a few
+/// lines. An explicit width/height in config or on the CLI still wins —
+/// see `apply_text_mode_sizing`.
+const TEXT_MODE_WIDTH: u32 = 560;
+const TEXT_MODE_HEIGHT: u32 = 132;
 
 #[derive(Parser, Debug, Clone)]
 #[command(
@@ -137,6 +157,11 @@ struct SharedState {
     peak: Mutex<PeakHold>,
     last_seq: Mutex<u64>,
     last_frame_at: Mutex<Instant>,
+    /// Latest transcript published by the daemon. `None` means no
+    /// streaming session is live (so text mode shows its listening
+    /// state); `Some("")` means a session is open but nothing has
+    /// decoded yet.
+    preview: Mutex<Option<String>>,
 }
 
 impl SharedState {
@@ -146,6 +171,7 @@ impl SharedState {
             peak: Mutex::new(PeakHold::new(decay_db_per_sec)),
             last_seq: Mutex::new(0),
             last_frame_at: Mutex::new(Instant::now() - Duration::from_secs(3600)),
+            preview: Mutex::new(None),
         }
     }
 }
@@ -175,6 +201,12 @@ fn main() -> anyhow::Result<()> {
     if let Some(g) = args.waveform_gain {
         osd_cfg.waveform_gain = g;
     }
+    apply_text_mode_sizing(
+        &mut osd_cfg,
+        args.width_px.is_some(),
+        args.height_px.is_some(),
+    );
+
     // peak_decay_db_per_sec has a clap default value, so this always
     // overrides whatever the file said. That's intentional: if the user
     // passes the flag, honor it; if they don't, the clap default kicks in.
@@ -219,6 +251,28 @@ fn main() -> anyhow::Result<()> {
         anyhow::bail!("GTK application exited with status {}", code);
     }
     Ok(())
+}
+
+/// Give `visual_mode = "text"` a surface tall enough to be worth reading.
+///
+/// The shared defaults (400x48) are sized for a waveform strip. Text mode
+/// on that surface shows a single clipped line, which is useless, so when
+/// the user has expressed no size preference we substitute panel
+/// proportions. "No preference" means the value still equals the shared
+/// default *and* no CLI flag was passed — an explicit `width_px = 400` in
+/// config is indistinguishable from the default here, which is the one
+/// wrinkle of this heuristic and why the override flags are consulted too.
+fn apply_text_mode_sizing(cfg: &mut OsdConfig, width_from_cli: bool, height_from_cli: bool) {
+    if cfg.visual_mode != OsdVisualMode::Text {
+        return;
+    }
+    let defaults = OsdConfig::default();
+    if !width_from_cli && cfg.width_px == defaults.width_px {
+        cfg.width_px = TEXT_MODE_WIDTH;
+    }
+    if !height_from_cli && cfg.height_px == defaults.height_px {
+        cfg.height_px = TEXT_MODE_HEIGHT;
+    }
 }
 
 /// Spawn the tokio runtime + IPC loop on a dedicated thread.
@@ -333,65 +387,97 @@ fn build_window(app: &Application, cfg: &OsdConfig, palette: Palette, state: Arc
     window.set_keyboard_mode(KeyboardMode::None);
     window.set_namespace(Some("voxtype-osd"));
 
-    // Centered positions use swayosd-style fractional placement:
-    // anchor only to Edge::Top with a margin of `top_margin × monitor_height`
-    // and let the layer shell center horizontally. Matches what users
-    // already see for volume/brightness/media-key feedback so the voxtype
-    // OSD lands in the familiar band.
+    // Centered positions anchor to a single horizontal edge and leave
+    // Left/Right unanchored, which makes the layer shell center the
+    // surface horizontally.
     //
-    // Corner positions still use the absolute `margin_px` model — fractional
-    // doesn't make sense there.
-    let centered = matches!(
-        cfg.position,
-        OsdPosition::BottomCenter | OsdPosition::TopCenter
-    );
+    // `bottom-center` keeps swayosd-style *fractional* placement: it
+    // anchors to Edge::Top at `top_margin × monitor_height` so the panel
+    // lands in the same band as volume/brightness/media-key feedback.
+    //
+    // `top-center` must anchor to Edge::Top with the absolute `margin_px`
+    // instead. Routing it through the fractional path (as every release
+    // through 0.7.5 did) offsets it by 0.85 × screen height, putting it
+    // at the *bottom* of the display — visually identical to
+    // `bottom-center`, which is what made the setting look broken.
+    // Set by the arms below when the surface is anchored to an edge with no
+    // margin, i.e. it physically touches that edge of the display.
+    // Every arm below assigns flush_top; only the corner arm can be flush
+    // against the bottom, so that one keeps a default.
+    let flush_top;
+    let mut flush_bottom = false;
 
-    if centered {
-        // Resolve monitor height to translate the fractional offset into
-        // pixels. Falls back to a conservative 1080 if the display can't be
-        // queried (extremely rare on Wayland-only systems where layer-shell
-        // is supported at all).
-        let monitor_height = focused_monitor_height_px().unwrap_or(1080);
-        let top_px = (cfg.top_margin.clamp(0.0, 1.0) * monitor_height as f32) as i32;
+    match cfg.position {
+        OsdPosition::BottomCenter => {
+            // Resolve monitor height to translate the fractional offset
+            // into pixels. Falls back to a conservative 1080 if the
+            // display can't be queried (extremely rare on Wayland-only
+            // systems where layer-shell is supported at all).
+            let monitor_height = focused_monitor_height_px().unwrap_or(1080);
+            let top_px = (cfg.top_margin.clamp(0.0, 1.0) * monitor_height as f32) as i32;
 
-        window.set_anchor(Edge::Top, true);
-        window.set_anchor(Edge::Bottom, false);
-        // Don't anchor Left/Right -> layer shell auto-centers horizontally.
-        window.set_anchor(Edge::Left, false);
-        window.set_anchor(Edge::Right, false);
-        window.set_margin(Edge::Top, top_px);
-    } else {
-        // Corner positions: legacy anchor + uniform pixel margin behavior.
-        let (anchor_top, anchor_bottom, anchor_left, anchor_right) = match cfg.position {
-            OsdPosition::BottomLeft => (false, true, true, false),
-            OsdPosition::BottomRight => (false, true, false, true),
-            OsdPosition::TopLeft => (true, false, true, false),
-            OsdPosition::TopRight => (true, false, false, true),
-            // Centered branch is handled above; unreachable here.
-            OsdPosition::BottomCenter | OsdPosition::TopCenter => unreachable!(),
-        };
-        window.set_anchor(Edge::Top, anchor_top);
-        window.set_anchor(Edge::Bottom, anchor_bottom);
-        window.set_anchor(Edge::Left, anchor_left);
-        window.set_anchor(Edge::Right, anchor_right);
+            window.set_anchor(Edge::Top, true);
+            window.set_anchor(Edge::Bottom, false);
+            window.set_anchor(Edge::Left, false);
+            window.set_anchor(Edge::Right, false);
+            window.set_margin(Edge::Top, top_px);
+            flush_top = top_px == 0;
+        }
+        OsdPosition::TopCenter => {
+            window.set_anchor(Edge::Top, true);
+            window.set_anchor(Edge::Bottom, false);
+            window.set_anchor(Edge::Left, false);
+            window.set_anchor(Edge::Right, false);
+            window.set_margin(Edge::Top, cfg.margin_px as i32);
+            flush_top = cfg.margin_px == 0;
+        }
+        _ => {
+            // Corner positions: legacy anchor + uniform pixel margin.
+            let (anchor_top, anchor_bottom, anchor_left, anchor_right) = match cfg.position {
+                OsdPosition::BottomLeft => (false, true, true, false),
+                OsdPosition::BottomRight => (false, true, false, true),
+                OsdPosition::TopLeft => (true, false, true, false),
+                OsdPosition::TopRight => (true, false, false, true),
+                // Centered variants are handled by the arms above.
+                OsdPosition::BottomCenter | OsdPosition::TopCenter => unreachable!(),
+            };
+            window.set_anchor(Edge::Top, anchor_top);
+            window.set_anchor(Edge::Bottom, anchor_bottom);
+            window.set_anchor(Edge::Left, anchor_left);
+            window.set_anchor(Edge::Right, anchor_right);
 
-        let m = cfg.margin_px as i32;
-        if anchor_top {
-            window.set_margin(Edge::Top, m);
-        }
-        if anchor_bottom {
-            window.set_margin(Edge::Bottom, m);
-        }
-        if anchor_left {
-            window.set_margin(Edge::Left, m);
-        }
-        if anchor_right {
-            window.set_margin(Edge::Right, m);
+            let m = cfg.margin_px as i32;
+            flush_top = anchor_top && m == 0;
+            flush_bottom = anchor_bottom && m == 0;
+            if anchor_top {
+                window.set_margin(Edge::Top, m);
+            }
+            if anchor_bottom {
+                window.set_margin(Edge::Bottom, m);
+            }
+            if anchor_left {
+                window.set_margin(Edge::Left, m);
+            }
+            if anchor_right {
+                window.set_margin(Edge::Right, m);
+            }
         }
     }
 
-    // Don't reserve space on the output: the OSD floats over windows.
-    window.set_exclusive_zone(0);
+    // Exclusive zone. We never reserve space for ourselves — the OSD floats
+    // over windows — but the two non-reserving values differ in a way that
+    // matters here:
+    //
+    //   0  don't reserve, but stay clear of everyone else's reserved strips
+    //  -1  don't reserve, and ignore theirs too
+    //
+    // At 0 a top-anchored surface with margin 0 lands *below* the Omarchy
+    // bar, because the compositor honours the bar's exclusive zone — which
+    // looks like the margin was ignored. A flush panel is meant to read as
+    // part of the bezel, so it has to overlap the bar: -1 when flush, 0
+    // otherwise so ordinary margins still measure from the usable area.
+    let flush = flush_top || flush_bottom;
+    window.set_exclusive_zone(if flush { -1 } else { 0 });
 
     // The drawing area fills the window.
     let drawing_area = DrawingArea::new();
@@ -399,8 +485,9 @@ fn build_window(app: &Application, cfg: &OsdConfig, palette: Palette, state: Arc
     drawing_area.set_content_height(cfg.height_px as i32);
     let state_for_draw = state.clone();
     let gain = cfg.waveform_gain as f64;
+    let visual_mode = cfg.visual_mode;
     drawing_area.set_draw_func(move |_area, cr, w, h| {
-        draw(cr, w, h, &palette, &state_for_draw, gain);
+        draw(cr, w, h, &palette, &state_for_draw, gain, visual_mode);
     });
     window.set_child(Some(&drawing_area));
 
@@ -419,6 +506,16 @@ fn build_window(app: &Application, cfg: &OsdConfig, palette: Palette, state: Arc
     let redraw_area = drawing_area.clone();
     let redraw_window = window.clone();
     let last_drawn_seq = Cell::new(0u64);
+    // Preview polling state. The file is only consulted in text mode, and
+    // only while frames are flowing, so an idle daemon costs nothing.
+    let preview_mode = cfg.visual_mode == OsdVisualMode::Text;
+    let preview_path = default_preview_path();
+    let last_preview_poll = Cell::new(Instant::now() - Duration::from_secs(3600));
+    let preview_dirty = Cell::new(false);
+    // True while the daemon reports a live streaming session (preview file
+    // present). Only meaningful in text mode; waveform mode keeps the
+    // original frames-only gating.
+    let session_active = Cell::new(false);
     // Tracks GTK visibility. Starts true because `window.present()` below maps
     // the surface, the first tick's idle check then hides it.
     let visible = Cell::new(true);
@@ -430,7 +527,28 @@ fn build_window(app: &Application, cfg: &OsdConfig, palette: Palette, state: Arc
             .lock()
             .map(|t| *t)
             .unwrap_or_else(|_| Instant::now() - Duration::from_secs(3600));
-        let idle = last_at.elapsed().as_secs_f32() > IDLE_TIMEOUT_SECS;
+        // Poll the preview file before the idle gate. Its presence marks an
+        // active session, and the daemon publishes it the moment the hotkey
+        // fires — before the first audio frame, since opening the capture
+        // device costs a few hundred milliseconds. Gating the surface on
+        // frames alone put the panel on screen ~0.6 s after the keypress.
+        if preview_mode
+            && last_preview_poll.get().elapsed() >= Duration::from_millis(PREVIEW_POLL_MS)
+        {
+            last_preview_poll.set(Instant::now());
+            let latest = read_preview(&preview_path);
+            session_active.set(latest.is_some());
+            if let Ok(mut slot) = redraw_state.preview.lock() {
+                if *slot != latest {
+                    *slot = latest;
+                    preview_dirty.set(true);
+                }
+            }
+        }
+
+        // A live session holds the surface up even with no frames yet.
+        let starved = last_at.elapsed().as_secs_f32() > IDLE_TIMEOUT_SECS;
+        let idle = starved && !session_active.get();
 
         if idle {
             if visible.get() {
@@ -471,9 +589,14 @@ fn build_window(app: &Application, cfg: &OsdConfig, palette: Palette, state: Arc
             }
         }
 
-        if cur_seq != last_drawn_seq.get() {
+        // Repaint on a new audio frame *or* on new transcript text. The
+        // seq check alone would be enough while the mic is live, but the
+        // preview also changes during the post-mic drain, when frames are
+        // synthetic silence at a fixed seq cadence.
+        if cur_seq != last_drawn_seq.get() || preview_dirty.get() {
             redraw_area.queue_draw();
             last_drawn_seq.set(cur_seq);
+            preview_dirty.set(false);
         }
         glib::ControlFlow::Continue
     });
@@ -503,6 +626,7 @@ fn draw(
     palette: &Palette,
     state: &Arc<SharedState>,
     gain: f64,
+    mode: OsdVisualMode,
 ) {
     let w = width as f64;
     let h = height as f64;
@@ -510,25 +634,258 @@ fn draw(
         return;
     }
 
-    // Clear background.
-    cr.set_source_rgba(
-        palette.background.r as f64,
-        palette.background.g as f64,
-        palette.background.b as f64,
-        palette.background.a as f64,
+    let bg = palette.background;
+    match mode {
+        OsdVisualMode::Waveform => {
+            // Square-cornered fill across the whole surface, as shipped.
+            cr.set_source_rgba(bg.r as f64, bg.g as f64, bg.b as f64, bg.a as f64);
+            cr.set_operator(cairo::Operator::Source);
+            cr.paint().ok();
+            cr.set_operator(cairo::Operator::Over);
+
+            // Layout: waveform area on the left (~92% width), gap (1%),
+            // then peak meter on the right (~7% width).
+            let meter_width = (w * 0.07).max(8.0);
+            let gap = (w * 0.01).max(2.0);
+            let wave_width = (w - meter_width - gap).max(0.0);
+
+            draw_waveform(cr, 0.0, 0.0, wave_width, h, palette, state, gain);
+            draw_peak_meter(cr, wave_width + gap, 0.0, meter_width, h, palette, state);
+        }
+        OsdVisualMode::Text => {
+            // Square-cornered fill across the whole surface. Omarchy is
+            // crisp-cornered throughout, and rounding this panel while it
+            // is pinned to the top edge left slivers of desktop showing at
+            // the lower corners, so the notch is drawn as a plain rect.
+            cr.set_source_rgba(bg.r as f64, bg.g as f64, bg.b as f64, bg.a as f64);
+            cr.set_operator(cairo::Operator::Source);
+            cr.paint().ok();
+            cr.set_operator(cairo::Operator::Over);
+
+            draw_text_preview(cr, w, h, palette, state);
+        }
+        OsdVisualMode::Pill => {
+            // A pill keeps its capsule silhouette — that is the whole
+            // point of the mode. Clear to fully transparent first so the
+            // corners read against whatever is behind the surface.
+            cr.set_source_rgba(0.0, 0.0, 0.0, 0.0);
+            cr.set_operator(cairo::Operator::Source);
+            cr.paint().ok();
+            cr.set_operator(cairo::Operator::Over);
+
+            rounded_rect(cr, 0.0, 0.0, w, h, PANEL_RADIUS);
+            cr.set_source_rgba(bg.r as f64, bg.g as f64, bg.b as f64, bg.a as f64);
+            cr.fill().ok();
+
+            // Keep every later stroke inside the rounded silhouette.
+            rounded_rect(cr, 0.0, 0.0, w, h, PANEL_RADIUS);
+            cr.clip();
+
+            draw_pill(cr, 0.0, 0.0, w, h, palette, state);
+        }
+    }
+}
+
+/// Append a rounded-rectangle sub-path to the current path.
+fn rounded_rect(cr: &Context, x: f64, y: f64, w: f64, h: f64, radius: f64) {
+    use std::f64::consts::{FRAC_PI_2, PI};
+    let r = radius.min(w / 2.0).min(h / 2.0).max(0.0);
+    cr.new_sub_path();
+    cr.arc(x + w - r, y + r, r, -FRAC_PI_2, 0.0);
+    cr.arc(x + w - r, y + h - r, r, 0.0, FRAC_PI_2);
+    cr.arc(x + r, y + h - r, r, FRAC_PI_2, PI);
+    cr.arc(x + r, y + r, r, PI, PI + FRAC_PI_2);
+    cr.close_path();
+}
+
+/// Current meter fill, 0.0..=1.0, from the held peak.
+fn current_level(state: &Arc<SharedState>) -> f64 {
+    let held = state.peak.lock().map(|p| p.held_dbfs).unwrap_or(-120.0);
+    peak_meter_fraction(held, METER_FLOOR_DBFS) as f64
+}
+
+/// Break `text` into lines that fit `max_w` at the context's current font.
+///
+/// Greedy word wrap. A single word wider than the whole line — rare from
+/// ASR but not impossible — is hard-split by characters rather than
+/// allowed to run off the panel.
+fn wrap_text(cr: &Context, text: &str, max_w: f64) -> Vec<String> {
+    let advance = |s: &str| cr.text_extents(s).map(|e| e.x_advance()).unwrap_or(0.0);
+    let mut lines: Vec<String> = Vec::new();
+    let mut cur = String::new();
+
+    for word in text.split_whitespace() {
+        let candidate = if cur.is_empty() {
+            word.to_string()
+        } else {
+            format!("{} {}", cur, word)
+        };
+        if advance(&candidate) <= max_w {
+            cur = candidate;
+            continue;
+        }
+        if !cur.is_empty() {
+            lines.push(std::mem::take(&mut cur));
+        }
+        // `word` alone on a fresh line: split it only if it still
+        // overflows on its own.
+        if advance(word) <= max_w {
+            cur = word.to_string();
+        } else {
+            let mut piece = String::new();
+            for ch in word.chars() {
+                let mut trial = piece.clone();
+                trial.push(ch);
+                if !piece.is_empty() && advance(&trial) > max_w {
+                    lines.push(std::mem::take(&mut piece));
+                }
+                piece.push(ch);
+            }
+            cur = piece;
+        }
+    }
+    if !cur.is_empty() {
+        lines.push(cur);
+    }
+    lines
+}
+
+/// VoiceInk-style live transcript panel.
+///
+/// Shows the tail of the decoded text — the most recent lines — with a
+/// state dot on the left. Older visible lines fade slightly so the eye
+/// lands on the newest words. Before anything decodes, the panel shows a
+/// listening line over the amplitude pill so the user still gets mic
+/// feedback.
+fn draw_text_preview(cr: &Context, w: f64, h: f64, palette: &Palette, state: &Arc<SharedState>) {
+    let fg = palette.foreground;
+    let accent = palette.accent;
+
+    cr.select_font_face(
+        "sans-serif",
+        cairo::FontSlant::Normal,
+        cairo::FontWeight::Normal,
     );
-    cr.set_operator(cairo::Operator::Source);
-    cr.paint().ok();
-    cr.set_operator(cairo::Operator::Over);
+    cr.set_font_size(PREVIEW_FONT_SIZE);
 
-    // Layout: waveform area on the left (~92% width), gap (1%), then peak
-    // meter on the right (~7% width).
-    let meter_width = (w * 0.07).max(8.0);
-    let gap = (w * 0.01).max(2.0);
-    let wave_width = (w - meter_width - gap).max(0.0);
+    // Status dot, sized by live amplitude so the panel still breathes
+    // with the voice without a scrolling waveform.
+    let level = current_level(state);
+    let dot_cx = PANEL_PAD_X + 5.0;
+    let dot_cy = PANEL_PAD_Y + PREVIEW_FONT_SIZE * 0.55;
+    let dot_r = 3.5 + level * 2.5;
+    cr.set_source_rgba(accent.r as f64, accent.g as f64, accent.b as f64, 0.95);
+    cr.arc(dot_cx, dot_cy, dot_r, 0.0, std::f64::consts::PI * 2.0);
+    cr.fill().ok();
 
-    draw_waveform(cr, 0.0, 0.0, wave_width, h, palette, state, gain);
-    draw_peak_meter(cr, wave_width + gap, 0.0, meter_width, h, palette, state);
+    let text_x = dot_cx + 6.0 + 10.0;
+    let max_w = (w - text_x - PANEL_PAD_X).max(1.0);
+    if max_w < 1.0 {
+        return;
+    }
+
+    let preview = state.preview.lock().ok().and_then(|p| p.clone());
+    let text = preview.unwrap_or_default();
+    let trimmed = text.trim();
+
+    if trimmed.is_empty() {
+        // Nothing decoded yet (or no streaming session). Show a quiet
+        // placeholder plus the pill, so the surface is never a blank box.
+        cr.set_source_rgba(fg.r as f64, fg.g as f64, fg.b as f64, 0.45);
+        cr.move_to(text_x, PANEL_PAD_Y + PREVIEW_FONT_SIZE);
+        cr.show_text("Listening…").ok();
+
+        let pill_h = 6.0;
+        let pill_y = h - PANEL_PAD_Y - pill_h;
+        draw_pill_bar(cr, text_x, pill_y, max_w, pill_h, palette, level);
+        return;
+    }
+
+    let line_h = PREVIEW_FONT_SIZE * PREVIEW_LINE_FACTOR;
+    let avail_h = h - PANEL_PAD_Y * 2.0;
+    let max_lines = ((avail_h / line_h).floor() as usize).max(1);
+
+    let lines = wrap_text(cr, trimmed, max_w);
+    let start = lines.len().saturating_sub(max_lines);
+    let visible = &lines[start..];
+
+    for (i, line) in visible.iter().enumerate() {
+        // Ramp older visible lines down toward 0.55 alpha; the newest
+        // line always renders at full strength.
+        let alpha = if visible.len() > 1 {
+            0.55 + 0.45 * (i as f64 / (visible.len() - 1) as f64)
+        } else {
+            1.0
+        };
+        cr.set_source_rgba(fg.r as f64, fg.g as f64, fg.b as f64, alpha);
+        let baseline = PANEL_PAD_Y + PREVIEW_FONT_SIZE + line_h * i as f64;
+        cr.move_to(text_x, baseline);
+        cr.show_text(line).ok();
+
+        // Caret after the final line: this text is still being revised.
+        if i + 1 == visible.len() {
+            let adv = cr.text_extents(line).map(|e| e.x_advance()).unwrap_or(0.0);
+            let caret_x = text_x + adv + 3.0;
+            if caret_x < w - PANEL_PAD_X {
+                cr.set_source_rgba(accent.r as f64, accent.g as f64, accent.b as f64, 0.85);
+                cr.rectangle(
+                    caret_x,
+                    baseline - PREVIEW_FONT_SIZE * 0.78,
+                    2.0,
+                    PREVIEW_FONT_SIZE * 0.92,
+                );
+                cr.fill().ok();
+            }
+        }
+    }
+}
+
+/// Thin amplitude capsule filling the panel — the waveform-free fallback
+/// for engines that cannot stream a transcript.
+fn draw_pill(
+    cr: &Context,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    palette: &Palette,
+    state: &Arc<SharedState>,
+) {
+    let pill_h = (h * 0.22).clamp(5.0, 12.0);
+    let pill_w = (w - PANEL_PAD_X * 2.0).max(1.0);
+    let pill_x = x + PANEL_PAD_X;
+    let pill_y = y + (h - pill_h) / 2.0;
+    draw_pill_bar(
+        cr,
+        pill_x,
+        pill_y,
+        pill_w,
+        pill_h,
+        palette,
+        current_level(state),
+    );
+}
+
+/// Draw one capsule: a dim track with an accent-filled leading portion.
+fn draw_pill_bar(cr: &Context, x: f64, y: f64, w: f64, h: f64, palette: &Palette, level: f64) {
+    let fg = palette.foreground;
+    let accent = palette.accent;
+    let r = h / 2.0;
+
+    rounded_rect(cr, x, y, w, h, r);
+    cr.set_source_rgba(fg.r as f64, fg.g as f64, fg.b as f64, 0.16);
+    cr.fill().ok();
+
+    // A hair of fill always shows so the capsule reads as "live" rather
+    // than "broken" during a pause in speech.
+    let fill_w = (w * level.clamp(0.0, 1.0)).max(h.min(w));
+    cr.save().ok();
+    rounded_rect(cr, x, y, w, h, r);
+    cr.clip();
+    rounded_rect(cr, x, y, fill_w, h, r);
+    cr.set_source_rgba(accent.r as f64, accent.g as f64, accent.b as f64, 0.95);
+    cr.fill().ok();
+    cr.restore().ok();
 }
 
 fn draw_waveform(

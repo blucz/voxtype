@@ -243,6 +243,7 @@ const OSD_STYLE_CHOICES: &[&str] = &["default"];
 /// means absent. Use `voxtype config unset osd.palette`.
 const OSD_PALETTE_CHOICES: &[&str] = &["omarchy", "fallback", "package", "custom"];
 const OSD_LAYOUT_CHOICES: &[&str] = &["compact", "wide", "minimal", "tile", "orb", "custom"];
+const OSD_VISUAL_MODE_CHOICES: &[&str] = &["waveform", "text", "pill"];
 const OSD_POSITION_CHOICES: &[&str] = &[
     "bottom-center",
     "top-center",
@@ -1038,6 +1039,15 @@ pub const CONFIG_KEYS: &[KeySpec] = &[
         "Corner or edge of the focused output the panel anchors to.",
     ),
     spec(
+        "osd.visual_mode",
+        "osd",
+        "visual_mode",
+        closed(OSD_VISUAL_MODE_CHOICES),
+        "OSD",
+        "Visual mode",
+        "What the panel draws: waveform, live transcript text, or a thin amplitude pill.",
+    ),
+    spec(
         "osd.width_px",
         "osd",
         "width_px",
@@ -1671,6 +1681,7 @@ pub fn resolve(key: &str, cfg: &Config) -> Option<Json> {
         },
         "osd.layout" => serde_json::to_value(cfg.osd.layout).ok()?,
         "osd.position" => serde_json::to_value(cfg.osd.position).ok()?,
+        "osd.visual_mode" => serde_json::to_value(cfg.osd.visual_mode).ok()?,
         "osd.width_px" => json!(cfg.osd.width_px),
         "osd.height_px" => json!(cfg.osd.height_px),
         "osd.margin_px" => json!(cfg.osd.margin_px),

@@ -44,6 +44,9 @@ pub struct ParakeetConfig {
 
     /// Streaming chunk length in seconds. Smaller = lower latency, more
     /// inference overhead. Maps to `UnifiedStreamingConfig::chunk_secs`.
+    ///
+    /// Must be a multiple of 0.08 s (see the note on the default fns) or
+    /// the streaming pipeline refuses to start.
     #[serde(default = "default_streaming_chunk_secs")]
     pub streaming_chunk_secs: f32,
 
@@ -58,16 +61,22 @@ pub struct ParakeetConfig {
     pub streaming_right_context_secs: f32,
 }
 
+// The cache-aware pipeline requires every window to land on a mel-frame
+// count divisible by 8. At the 10 ms feature hop that means each of these
+// must be a multiple of 0.08 s — 0.5 and 1.5 are not, so the values these
+// functions returned before (0.5 / 1.5 / 0.5) made `UnifiedStreamingConfig::
+// validate()` reject the *default* config and streaming failed to start at
+// all. These are the nearest valid values.
 fn default_streaming_chunk_secs() -> f32 {
-    0.5
+    0.48
 }
 
 fn default_streaming_left_context_secs() -> f32 {
-    1.5
+    1.6
 }
 
 fn default_streaming_right_context_secs() -> f32 {
-    0.5
+    0.48
 }
 
 impl Default for ParakeetConfig {
