@@ -30,6 +30,7 @@ mod record;
 pub(crate) mod sigpipe;
 mod status;
 mod transcribe_file;
+mod transcript;
 mod updates;
 
 /// Apply CLI overrides to `config`, then dispatch the subcommand.

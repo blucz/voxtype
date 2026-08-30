@@ -363,10 +363,13 @@ sample_rate = 16000
 
 Maximum recording duration in seconds. Recording automatically stops after this limit as a safety measure. When the limit is reached, the captured audio is transcribed and output normally rather than being discarded.
 
+Set to `0` to remove the cap entirely. Consider it for long-form dictation: an automatic stop delivers text at a moment you did not choose, into whatever window happens to have focus, and anything said after it is lost because there is no longer a recording to say it into.
+
 **Example:**
 ```toml
 [audio]
 max_duration_secs = 120  # Allow 2-minute recordings
+max_duration_secs = 0    # No limit; recording ends only when you end it
 ```
 
 ### pause_media
@@ -1706,6 +1709,31 @@ paste_keys = "shift+insert"  # For Hyprland/Omarchy
 - Modifiers: `ctrl`, `shift`, `alt`, `super` (also `leftctrl`, `rightctrl`, etc.)
 - Letters: `a-z`
 - Special: `insert`, `enter`
+
+### transcript_journal
+
+**Type:** Boolean
+**Default:** `true`
+**Required:** No
+
+Keep a durable record of every transcription, appended *before* the text is delivered, plus anything a cancel discards.
+
+Dictated text exists only at the moment it is delivered. A window that lost focus, a field that swallowed the paste, a mis-aimed cancel — each destroys it with no undo, and the longer the dictation the more there is to lose. The journal is what makes those recoverable:
+
+```bash
+voxtype transcript last          # print the most recent transcript
+voxtype transcript last --copy   # put it back on the clipboard
+voxtype transcript list -n 20    # recent transcripts, ✗ marks discarded ones
+voxtype transcript path          # where the journal lives
+```
+
+One JSON object per line at `$XDG_STATE_HOME/voxtype/transcripts.jsonl` (`~/.local/state/voxtype/transcripts.jsonl`), trimmed to the most recent 500 entries once it passes 4 MB.
+
+**Example:**
+```toml
+[output]
+transcript_journal = false  # Never write transcripts to disk
+```
 
 ### restore_clipboard
 

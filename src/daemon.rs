@@ -1153,6 +1153,22 @@ impl Daemon {
         }
     }
 
+    /// Append an utterance to the transcript journal.
+    ///
+    /// Best-effort and non-fatal in both directions: a failed journal write
+    /// must never cost the user the delivery, and journalling happens
+    /// *before* delivery so a delivery that goes wrong still leaves the
+    /// text recoverable.
+    fn journal(&self, outcome: crate::journal::Outcome, text: &str) {
+        if !self.config.output.transcript_journal {
+            return;
+        }
+        let path = crate::journal::default_path();
+        if let Err(e) = crate::journal::append(&path, outcome, text) {
+            tracing::warn!("Failed to journal transcript: {}", e);
+        }
+    }
+
     /// Remove the preview file, telling the OSD the session is over.
     fn clear_preview(&self) {
         if !self.config.osd.enabled {
@@ -1247,6 +1263,10 @@ impl Daemon {
             }
         }
 
+        if let Some(s) = streaming_session.as_ref() {
+            self.journal(crate::journal::Outcome::Transcribed, s.finalized_text());
+        }
+
         self.stop_streaming_drain_pump();
         *streaming_session = None;
         *streaming_chain = None;
@@ -1293,6 +1313,13 @@ impl Daemon {
             if let Err(e) = s.rewind().await {
                 tracing::warn!("Streaming rewind failed: {}", e);
             }
+        }
+        // Journal what the cancel threw away. A cancel is the one way to
+        // lose a long dictation on purpose, which makes it exactly the
+        // case worth being able to undo.
+        if let Some(s) = streaming_session.as_ref() {
+            let discarded = format!("{}{}", s.finalized_text(), s.partial());
+            self.journal(crate::journal::Outcome::Cancelled, &discarded);
         }
         self.stop_streaming_drain_pump();
         *streaming_session = None;
@@ -2516,6 +2543,10 @@ impl Daemon {
 
                     let output_chain = output::create_output_chain(&output_config);
 
+                    // Journal before delivering: if the paste lands in the
+                    // wrong window, the text is still recoverable.
+                    self.journal(crate::journal::Outcome::Transcribed, &final_text);
+
                     // Output the text
                     *state = State::Outputting {
                         text: final_text.clone(),
@@ -2899,8 +2930,14 @@ impl Daemon {
         // Audio capture (created fresh for each recording)
         let mut audio_capture: Option<Box<dyn AudioCapture>> = None;
 
-        // Recording timeout
-        let max_duration = Duration::from_secs(self.config.audio.max_duration_secs as u64);
+        // Recording timeout. `max_duration_secs = 0` disables the cap
+        // entirely. A long dictation should end when the speaker says so,
+        // not when a timer fires mid-sentence and dumps a half utterance
+        // into whatever window happens to hold focus.
+        let max_duration = match self.config.audio.max_duration_secs {
+            0 => None,
+            secs => Some(Duration::from_secs(secs as u64)),
+        };
 
         let activation_mode = self.config.hotkey.mode;
         if self.config.hotkey.enabled {
@@ -3579,7 +3616,9 @@ impl Daemon {
                     // tick while the streaming session drains server-side
                     // (state stays Streaming until Ended arrives).
                     let timeout_fired = audio_capture.is_some()
-                        && state.recording_duration().is_some_and(|d| d > max_duration);
+                        && max_duration.is_some_and(|max| {
+                            state.recording_duration().is_some_and(|d| d > max)
+                        });
                     if timeout_fired {
                         // Streaming has its own clean stop path: skip the
                         // batch_transcribe branch below to avoid opening a
@@ -3588,7 +3627,7 @@ impl Daemon {
                         if state.is_streaming() {
                             tracing::warn!(
                                 "Recording timeout ({:.0}s limit) while streaming; closing capture",
-                                max_duration.as_secs_f32()
+                                max_duration.map_or(0.0, |m| m.as_secs_f32())
                             );
                             self.stop_streaming_capture(&mut audio_capture).await;
                             continue;
@@ -3596,7 +3635,7 @@ impl Daemon {
 
                         tracing::warn!(
                             "Recording timeout ({:.0}s limit), transcribing captured audio",
-                            max_duration.as_secs_f32()
+                            max_duration.map_or(0.0, |m| m.as_secs_f32())
                         );
 
                         cleanup_output_mode_override();

@@ -68,6 +68,16 @@ pub struct OutputConfig {
     #[serde(default)]
     pub wtype_shift_prefix: bool,
 
+    /// Keep a durable journal of every transcription (and of anything
+    /// discarded by a cancel) under the state dir, readable with
+    /// `voxtype transcript last`.
+    ///
+    /// On by default: dictated text exists only at the moment it is
+    /// delivered, so a mis-focused window or a stray cancel destroys it
+    /// with no undo. Set to false if transcripts should not touch disk.
+    #[serde(default = "default_transcript_journal")]
+    pub transcript_journal: bool,
+
     /// Command to run when recording starts (e.g., switch to compositor submap)
     /// Useful for entering a mode where cancel keybindings are effective
     #[serde(default)]
@@ -192,6 +202,7 @@ impl Default for OutputConfig {
             append_text: None,
             shift_enter_newlines: false,
             wtype_shift_prefix: false,
+            transcript_journal: default_transcript_journal(),
             pre_recording_command: None,
             pre_output_command: None,
             post_output_command: None,
@@ -215,6 +226,10 @@ impl Default for OutputConfig {
 
 fn default_modifier_release_timeout_ms() -> u64 {
     750
+}
+
+fn default_transcript_journal() -> bool {
+    true
 }
 
 /// Result of applying a per-language XKB layout/variant hint to output config.

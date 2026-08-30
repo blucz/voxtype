@@ -16,6 +16,7 @@ use super::meeting::run_meeting_command;
 use super::record::send_record_command;
 use super::status::run_status;
 use super::transcribe_file::transcribe_file;
+use super::transcript::run_transcript_command;
 use super::updates::check_for_updates;
 
 /// Check if running as root and warn for commands that don't need elevated privileges.
@@ -417,6 +418,10 @@ pub(crate) async fn dispatch(
 
         Commands::Record { action } => {
             send_record_command(&config, action, top_level_model.as_deref())?;
+        }
+
+        Commands::Transcript { action } => {
+            run_transcript_command(action)?;
         }
 
         Commands::Meeting { action } => {

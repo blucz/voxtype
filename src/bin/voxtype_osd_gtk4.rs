@@ -31,7 +31,9 @@ use voxtype::audio::levels::{AudioFrame, FRAME_HZ};
 use voxtype::config::Config as VoxtypeConfig;
 use voxtype::osd::config::{OsdConfig, OsdPosition, OsdVisualMode};
 use voxtype::osd::ipc::{resolve_socket_path, run_ipc_loop, FrameRing, DEFAULT_RING_DEPTH};
-use voxtype::osd::preview::{default_preview_path, read_preview, PREVIEW_POLL_MS};
+use voxtype::osd::preview::{
+    default_hint_path, default_preview_path, read_hint, read_preview, PREVIEW_POLL_MS,
+};
 use voxtype::osd::theme::ThemeWatcher;
 use voxtype::osd::visual::{peak_meter_fraction, project_envelope, MeterZone, Palette, PeakHold};
 
@@ -162,6 +164,12 @@ struct SharedState {
     /// state); `Some("")` means a session is open but nothing has
     /// decoded yet.
     preview: Mutex<Option<String>>,
+    /// Transient one-line message overlaid on the transcript panel, e.g.
+    /// the armed-cancel prompt. `None` when nothing is armed.
+    hint: Mutex<Option<String>>,
+    /// When the current session started, for the elapsed clock. A long
+    /// dictation has no other way to tell you it is still running.
+    session_started: Mutex<Option<Instant>>,
 }
 
 impl SharedState {
@@ -172,6 +180,8 @@ impl SharedState {
             last_seq: Mutex::new(0),
             last_frame_at: Mutex::new(Instant::now() - Duration::from_secs(3600)),
             preview: Mutex::new(None),
+            hint: Mutex::new(None),
+            session_started: Mutex::new(None),
         }
     }
 }
@@ -510,6 +520,7 @@ fn build_window(app: &Application, cfg: &OsdConfig, palette: Palette, state: Arc
     // only while frames are flowing, so an idle daemon costs nothing.
     let preview_mode = cfg.visual_mode == OsdVisualMode::Text;
     let preview_path = default_preview_path();
+    let hint_path = default_hint_path();
     let last_preview_poll = Cell::new(Instant::now() - Duration::from_secs(3600));
     let preview_dirty = Cell::new(false);
     // True while the daemon reports a live streaming session (preview file
@@ -537,10 +548,28 @@ fn build_window(app: &Application, cfg: &OsdConfig, palette: Palette, state: Arc
         {
             last_preview_poll.set(Instant::now());
             let latest = read_preview(&preview_path);
+            let was_active = session_active.get();
             session_active.set(latest.is_some());
+            // Stamp the session clock on the edges only, so the elapsed
+            // readout survives the transcript going quiet mid-sentence.
+            if was_active != session_active.get() {
+                if let Ok(mut started) = redraw_state.session_started.lock() {
+                    *started = session_active.get().then(Instant::now);
+                }
+                preview_dirty.set(true);
+            }
             if let Ok(mut slot) = redraw_state.preview.lock() {
                 if *slot != latest {
                     *slot = latest;
+                    preview_dirty.set(true);
+                }
+            }
+            // Hints expire on their own deadline, so this poll is also
+            // what takes an elapsed one off screen.
+            let hint = read_hint(&hint_path);
+            if let Ok(mut slot) = redraw_state.hint.lock() {
+                if *slot != hint {
+                    *slot = hint;
                     preview_dirty.set(true);
                 }
             }
@@ -750,13 +779,63 @@ fn wrap_text(cr: &Context, text: &str, max_w: f64) -> Vec<String> {
     lines
 }
 
+/// Width of the left gutter in the text panel: the status dot with the
+/// elapsed clock beneath it. Wide enough for "MM:SS" at [`CLOCK_FONT_SIZE`],
+/// and for "H:MM:SS" past the hour without the text column shifting.
+const GUTTER_W: f64 = 46.0;
+
+/// Font size of the elapsed clock. Deliberately much smaller than the
+/// transcript: it is a reassurance, not something to read.
+const CLOCK_FONT_SIZE: f64 = 10.0;
+
+/// Upper bound on transcript characters handed to [`wrap_text`].
+///
+/// Only the last few lines are ever drawn, but wrapping measures every
+/// word through cairo — so wrapping the whole transcript makes each frame
+/// cost O(everything said so far). At 60 fps a half-hour dictation turns
+/// that into a busy loop. 4000 characters is an order of magnitude more
+/// than the tallest panel can show, and bounds the per-frame work.
+const WRAP_TAIL_CHARS: usize = 4000;
+
+/// The trailing slice of `text` worth wrapping: at most `max_chars`
+/// characters, cut at a word boundary so the first visible line does not
+/// start mid-word.
+fn wrap_tail(text: &str, max_chars: usize) -> &str {
+    if text.chars().count() <= max_chars {
+        return text;
+    }
+    // Byte offset of the character `max_chars` back from the end.
+    let cut = text
+        .char_indices()
+        .nth(text.chars().count() - max_chars)
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+    let tail = &text[cut..];
+    match tail.find(char::is_whitespace) {
+        Some(i) => tail[i..].trim_start(),
+        None => tail,
+    }
+}
+
+/// Elapsed time as `M:SS`, or `H:MM:SS` once past an hour.
+fn format_elapsed(d: Duration) -> String {
+    let total = d.as_secs();
+    let (h, m, s) = (total / 3600, (total % 3600) / 60, total % 60);
+    if h > 0 {
+        format!("{}:{:02}:{:02}", h, m, s)
+    } else {
+        format!("{}:{:02}", m, s)
+    }
+}
+
 /// VoiceInk-style live transcript panel.
 ///
 /// Shows the tail of the decoded text — the most recent lines — with a
-/// state dot on the left. Older visible lines fade slightly so the eye
-/// lands on the newest words. Before anything decodes, the panel shows a
-/// listening line over the amplitude pill so the user still gets mic
-/// feedback.
+/// state dot and an elapsed clock in the left gutter. Older visible lines
+/// fade slightly so the eye lands on the newest words. Before anything
+/// decodes, the panel shows a listening line over the amplitude pill so
+/// the user still gets mic feedback. An armed hint, when present, takes
+/// the bottom line.
 fn draw_text_preview(cr: &Context, w: f64, h: f64, palette: &Palette, state: &Arc<SharedState>) {
     let fg = palette.foreground;
     let accent = palette.accent;
@@ -778,11 +857,34 @@ fn draw_text_preview(cr: &Context, w: f64, h: f64, palette: &Palette, state: &Ar
     cr.arc(dot_cx, dot_cy, dot_r, 0.0, std::f64::consts::PI * 2.0);
     cr.fill().ok();
 
-    let text_x = dot_cx + 6.0 + 10.0;
+    // Elapsed clock under the dot. Without it a long dictation gives no
+    // sign of how long it has been running — and no way to notice that it
+    // is still running at all.
+    let started = state.session_started.lock().ok().and_then(|t| *t);
+    if let Some(started) = started {
+        cr.set_font_size(CLOCK_FONT_SIZE);
+        cr.set_source_rgba(fg.r as f64, fg.g as f64, fg.b as f64, 0.5);
+        cr.move_to(PANEL_PAD_X, dot_cy + CLOCK_FONT_SIZE + 7.0);
+        cr.show_text(&format_elapsed(started.elapsed())).ok();
+        cr.set_font_size(PREVIEW_FONT_SIZE);
+    }
+
+    let text_x = PANEL_PAD_X + GUTTER_W;
     let max_w = (w - text_x - PANEL_PAD_X).max(1.0);
     if max_w < 1.0 {
         return;
     }
+
+    let line_h = PREVIEW_FONT_SIZE * PREVIEW_LINE_FACTOR;
+
+    // An armed hint owns the bottom line; the transcript gives it up.
+    let hint = state.hint.lock().ok().and_then(|hh| hh.clone());
+    if let Some(ref hint) = hint {
+        cr.set_source_rgba(accent.r as f64, accent.g as f64, accent.b as f64, 0.95);
+        cr.move_to(text_x, h - PANEL_PAD_Y);
+        cr.show_text(hint).ok();
+    }
+    let reserved_h = if hint.is_some() { line_h } else { 0.0 };
 
     let preview = state.preview.lock().ok().and_then(|p| p.clone());
     let text = preview.unwrap_or_default();
@@ -796,16 +898,15 @@ fn draw_text_preview(cr: &Context, w: f64, h: f64, palette: &Palette, state: &Ar
         cr.show_text("Listening…").ok();
 
         let pill_h = 6.0;
-        let pill_y = h - PANEL_PAD_Y - pill_h;
+        let pill_y = h - PANEL_PAD_Y - pill_h - reserved_h;
         draw_pill_bar(cr, text_x, pill_y, max_w, pill_h, palette, level);
         return;
     }
 
-    let line_h = PREVIEW_FONT_SIZE * PREVIEW_LINE_FACTOR;
-    let avail_h = h - PANEL_PAD_Y * 2.0;
+    let avail_h = h - PANEL_PAD_Y * 2.0 - reserved_h;
     let max_lines = ((avail_h / line_h).floor() as usize).max(1);
 
-    let lines = wrap_text(cr, trimmed, max_w);
+    let lines = wrap_text(cr, wrap_tail(trimmed, WRAP_TAIL_CHARS), max_w);
     let start = lines.len().saturating_sub(max_lines);
     let visible = &lines[start..];
 
@@ -1044,5 +1145,50 @@ fn draw_peak_meter(
         cr.move_to(x, py);
         cr.line_to(x + w, py);
         cr.stroke().ok();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wrap_tail_returns_short_text_untouched() {
+        assert_eq!(wrap_tail("hello world", 4000), "hello world");
+    }
+
+    #[test]
+    fn wrap_tail_cuts_at_a_word_boundary() {
+        // 40 characters, cut to at most 12: the slice starts at a word,
+        // never mid-word.
+        let text = "alpha bravo charlie delta echo foxtrot";
+        let tail = wrap_tail(text, 12);
+        assert!(text.ends_with(tail), "{tail:?} must be a suffix");
+        assert!(tail.chars().count() <= 12);
+        assert!(!tail.starts_with(char::is_whitespace));
+        assert!(text.split_whitespace().any(|w| tail.starts_with(w)));
+    }
+
+    #[test]
+    fn wrap_tail_survives_multibyte_text() {
+        let text = "ααα βββ γγγ δδδ εεε";
+        let tail = wrap_tail(text, 7);
+        assert!(text.ends_with(tail));
+        assert!(tail.chars().count() <= 7);
+    }
+
+    #[test]
+    fn wrap_tail_falls_back_to_a_hard_cut_without_whitespace() {
+        let text = "abcdefghijklmnop";
+        assert_eq!(wrap_tail(text, 4).chars().count(), 4);
+    }
+
+    #[test]
+    fn elapsed_formats_minutes_then_hours() {
+        assert_eq!(format_elapsed(Duration::from_secs(0)), "0:00");
+        assert_eq!(format_elapsed(Duration::from_secs(9)), "0:09");
+        assert_eq!(format_elapsed(Duration::from_secs(75)), "1:15");
+        assert_eq!(format_elapsed(Duration::from_secs(1800)), "30:00");
+        assert_eq!(format_elapsed(Duration::from_secs(3725)), "1:02:05");
     }
 }

@@ -156,7 +156,20 @@ pub enum RecordAction {
         no_smart_auto_submit: bool,
     },
     /// Cancel current recording or transcription (discard without output)
-    Cancel,
+    Cancel {
+        /// Require two presses to actually discard.
+        ///
+        /// The first press arms a cancel and shows "press again to
+        /// discard" in the OSD; a second press inside the window goes
+        /// through, and anything later re-arms instead. Meant for a key
+        /// the compositor swallows during recording (Escape), where a
+        /// single stray press must not throw away a long dictation.
+        ///
+        /// Takes an optional window in milliseconds: `--double-tap`
+        /// defaults to 1500, `--double-tap=800` narrows it.
+        #[arg(long, value_name = "MS", num_args = 0..=1, default_missing_value = "1500")]
+        double_tap: Option<u64>,
+    },
 }
 
 /// Resolve a paired enable/disable flag set into a tri-state override.
@@ -197,7 +210,7 @@ impl RecordAction {
                 paste,
                 ..
             } => (*type_mode, *clipboard, *paste, None),
-            RecordAction::Cancel => return None,
+            RecordAction::Cancel { .. } => return None,
         };
 
         if type_mode {
@@ -220,7 +233,7 @@ impl RecordAction {
     pub fn file_path(&self) -> Option<&str> {
         match self {
             RecordAction::Start { file, .. } | RecordAction::Toggle { file, .. } => file.as_deref(),
-            RecordAction::Stop { .. } | RecordAction::Cancel => None,
+            RecordAction::Stop { .. } | RecordAction::Cancel { .. } => None,
         }
     }
 
@@ -231,7 +244,7 @@ impl RecordAction {
             RecordAction::Start { model, .. } | RecordAction::Toggle { model, .. } => {
                 model.as_deref()
             }
-            RecordAction::Stop { .. } | RecordAction::Cancel => None,
+            RecordAction::Stop { .. } | RecordAction::Cancel { .. } => None,
         }
     }
 
@@ -242,7 +255,7 @@ impl RecordAction {
             RecordAction::Start { profile, .. } | RecordAction::Toggle { profile, .. } => {
                 profile.as_deref()
             }
-            RecordAction::Stop { .. } | RecordAction::Cancel => None,
+            RecordAction::Stop { .. } | RecordAction::Cancel { .. } => None,
         }
     }
 
@@ -260,7 +273,7 @@ impl RecordAction {
                 no_auto_submit,
                 ..
             } => override_from_flags(*auto_submit, *no_auto_submit),
-            RecordAction::Stop { .. } | RecordAction::Cancel => None,
+            RecordAction::Stop { .. } | RecordAction::Cancel { .. } => None,
         }
     }
 
@@ -278,7 +291,7 @@ impl RecordAction {
                 no_shift_enter_newlines,
                 ..
             } => override_from_flags(*shift_enter_newlines, *no_shift_enter_newlines),
-            RecordAction::Stop { .. } | RecordAction::Cancel => None,
+            RecordAction::Stop { .. } | RecordAction::Cancel { .. } => None,
         }
     }
 
@@ -296,7 +309,7 @@ impl RecordAction {
                 no_smart_auto_submit,
                 ..
             } => override_from_flags(*smart_auto_submit, *no_smart_auto_submit),
-            RecordAction::Stop { .. } | RecordAction::Cancel => None,
+            RecordAction::Stop { .. } | RecordAction::Cancel { .. } => None,
         }
     }
 }
@@ -312,7 +325,7 @@ mod tests {
         let cli = Cli::parse_from(["voxtype", "record", "cancel"]);
         match cli.command {
             Some(Commands::Record {
-                action: RecordAction::Cancel,
+                action: RecordAction::Cancel { .. },
             }) => {
                 // Success - cancel action parsed correctly
             }

@@ -81,7 +81,7 @@ impl Field {
 const THEME_CHOICES: &[&str] = &["default", "subtle", "mechanical"];
 /// Step in seconds for the max-duration cycler.
 const DURATION_STEP: u32 = 30;
-const DURATION_MIN: u32 = 30;
+const DURATION_MIN: u32 = 0;
 const DURATION_MAX: u32 = 1800;
 const VOLUME_STEP: f32 = 0.1;
 const DUCK_VOLUME_STEP: i32 = 5;
@@ -297,7 +297,11 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
         FormRowSpec::new(
             state.field == Field::MaxDuration,
             "Max recording (seconds)",
-            state.max_duration_secs.to_string(),
+            if state.max_duration_secs == 0 {
+                "unlimited".to_string()
+            } else {
+                state.max_duration_secs.to_string()
+            },
         ),
         FormRowSpec::new(
             state.field == Field::PauseMedia,

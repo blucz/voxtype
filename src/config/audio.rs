@@ -13,7 +13,9 @@ pub struct AudioConfig {
     #[serde(default = "default_audio_sample_rate")]
     pub sample_rate: u32,
 
-    /// Maximum recording duration in seconds (safety limit)
+    /// Maximum recording duration in seconds (safety limit).
+    /// `0` disables the limit: recording runs until it is stopped or
+    /// cancelled.
     #[serde(default = "default_audio_max_duration_secs")]
     pub max_duration_secs: u32,
 

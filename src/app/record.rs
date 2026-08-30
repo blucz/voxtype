@@ -26,11 +26,8 @@ pub(crate) fn send_record_command(
     let pid = daemon_status::check_daemon_running()?;
 
     // Handle cancel separately (uses file trigger instead of signal)
-    if matches!(action, RecordAction::Cancel) {
-        let cancel_file = config::Config::runtime_dir().join("cancel");
-        std::fs::write(&cancel_file, "cancel")
-            .map_err(|e| anyhow::anyhow!("Failed to write cancel file: {}", e))?;
-        return Ok(());
+    if let RecordAction::Cancel { double_tap } = action {
+        return cancel(double_tap);
     }
 
     // Write output mode override file if specified
@@ -153,7 +150,7 @@ pub(crate) fn send_record_command(
                 libc::SIGUSR1 // Start
             }
         }
-        RecordAction::Cancel => unreachable!(), // Handled above
+        RecordAction::Cancel { .. } => unreachable!(), // Handled above
     };
 
     // With --wait, clear a previous run's completion sidecar before signalling,
@@ -243,6 +240,53 @@ impl WaitOutcome {
 
 /// Block until the daemon publishes this recording's outcome.
 ///
+/// Path of the file whose mtime records the last armed cancel tap.
+fn cancel_arm_path() -> PathBuf {
+    config::Config::runtime_dir().join("cancel_arm")
+}
+
+/// Discard the current recording or transcription.
+///
+/// With `double_tap_ms`, the first call only arms: it touches the arm file
+/// and puts a hint on screen, and returns without telling the daemon
+/// anything. A second call inside the window sees a fresh arm file and
+/// discards for real. Any call after the window re-arms instead, so a
+/// stray press can never reach back and cancel a dictation minutes later.
+///
+/// The arm state lives in a file rather than in the daemon because the
+/// caller is a compositor keybind: a short-lived process with nowhere to
+/// keep state, firing on a key the daemon never sees.
+fn cancel(double_tap_ms: Option<u64>) -> anyhow::Result<()> {
+    let hint_path = voxtype::osd::preview::default_hint_path();
+
+    if let Some(window_ms) = double_tap_ms {
+        let arm = cancel_arm_path();
+        let armed = std::fs::metadata(&arm)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|since| since < Duration::from_millis(window_ms));
+
+        if !armed {
+            // Write, don't just touch: the file may not exist yet, and a
+            // fresh write updates mtime on every platform we target.
+            std::fs::write(&arm, "armed")
+                .map_err(|e| anyhow::anyhow!("Failed to arm cancel: {}", e))?;
+            let _ =
+                voxtype::osd::preview::write_hint(&hint_path, "press again to discard", window_ms);
+            return Ok(());
+        }
+
+        let _ = std::fs::remove_file(&arm);
+    }
+
+    voxtype::osd::preview::clear_hint(&hint_path);
+    let cancel_file = config::Config::runtime_dir().join("cancel");
+    std::fs::write(&cancel_file, "cancel")
+        .map_err(|e| anyhow::anyhow!("Failed to write cancel file: {}", e))?;
+    Ok(())
+}
+
 /// The daemon writes the completion sidecar after the transcript itself, so
 /// seeing the sidecar means the transcript is complete. A state file that
 /// returns to idle without one is the backstop: that means the recording ended

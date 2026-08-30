@@ -46,7 +46,8 @@ device = "default"
 # Sample rate in Hz (whisper expects 16000)
 sample_rate = 16000
 
-# Maximum recording duration in seconds (safety limit)
+# Maximum recording duration in seconds (safety limit).
+# 0 removes the cap: recording runs until you stop or cancel it.
 max_duration_secs = 60
 
 # Pause MPRIS media players (Spotify, Firefox, etc.) before recording starts,

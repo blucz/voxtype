@@ -255,6 +255,14 @@ impl Config {
         .unwrap_or_else(|| PathBuf::from("."))
     }
 
+    /// Voxtype's user state directory, honoring `$XDG_STATE_HOME`
+    /// (default `~/.local/state`). State is data the user never edits and
+    /// would not miss if it vanished — currently just the transcript
+    /// journal — which is why it is not `data_dir`, where models live.
+    pub fn state_dir() -> PathBuf {
+        Self::xdg_dir("XDG_STATE_HOME", ".local/state", None).unwrap_or_else(|| PathBuf::from("."))
+    }
+
     /// Resolve a `voxtype` user dir. An explicit absolute `$xdg_var` wins;
     /// otherwise `$HOME/<default_rel>/voxtype`. Falls back to an existing
     /// `legacy` platform-native dir so an upgrade never orphans a prior install.

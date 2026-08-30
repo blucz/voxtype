@@ -3,7 +3,7 @@
 use clap::builder::PossibleValuesParser;
 use clap::Subcommand;
 
-use super::{ConfigAction, InfoAction, MeetingAction, RecordAction, SetupAction};
+use super::{ConfigAction, InfoAction, MeetingAction, RecordAction, SetupAction, TranscriptAction};
 
 #[derive(Subcommand)]
 pub enum Commands {
@@ -149,6 +149,16 @@ pub enum Commands {
     Record {
         #[command(subcommand)]
         action: RecordAction,
+    },
+
+    /// Read back what was dictated
+    ///
+    /// Every transcription is journalled before it is delivered, so text
+    /// that went to the wrong window — or that a cancel discarded — can
+    /// still be recovered. Disable with `output.transcript_journal`.
+    Transcript {
+        #[command(subcommand)]
+        action: TranscriptAction,
     },
 
     /// Meeting transcription mode

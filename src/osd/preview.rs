@@ -65,6 +65,9 @@ pub fn write_preview(path: &Path, text: &str) -> io::Result<()> {
 }
 
 /// Remove the preview file, signalling "no active session" to the OSD.
+///
+/// Also drops any armed hint: hints are scoped to a session, and one left
+/// behind would reappear over the next recording's first frames.
 pub fn clear_preview(path: &Path) {
     if path.exists() {
         if let Err(e) = std::fs::remove_file(path) {
@@ -75,6 +78,75 @@ pub fn clear_preview(path: &Path) {
     if staged.exists() {
         let _ = std::fs::remove_file(&staged);
     }
+    clear_hint(&default_hint_path());
+}
+
+/// Default path for the transient hint file.
+///
+/// The hint is a short line the OSD overlays on the transcript panel —
+/// currently only "press Esc again to discard". It is a second file rather
+/// than a field in the preview because the two have different writers: the
+/// daemon owns the preview, while `voxtype record cancel --double-tap`
+/// (running as a keybind, with no daemon round-trip) owns the hint.
+pub fn default_hint_path() -> PathBuf {
+    Config::runtime_dir().join("hint.txt")
+}
+
+/// Arm a hint that expires on its own `ttl_ms` from now.
+///
+/// The deadline is written into the file rather than tracked by a timer,
+/// so the writer can be a one-shot process that exits immediately and no
+/// one has to come back to clean up.
+pub fn write_hint(path: &Path, text: &str, ttl_ms: u64) -> io::Result<()> {
+    let deadline = now_ms().saturating_add(ttl_ms);
+    let body = format!("{}\n{}", deadline, text);
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    let staged = temp_sibling(path);
+    std::fs::write(&staged, body.as_bytes())?;
+    if let Err(e) = std::fs::rename(&staged, path) {
+        let _ = std::fs::remove_file(&staged);
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Read the hint, if one is armed and still inside its deadline.
+///
+/// An expired hint reads as `None` and is left on disk; the next
+/// `clear_preview` sweeps it. Deleting on read would make this racy
+/// against a writer arming a fresh hint in the same instant.
+pub fn read_hint(path: &Path) -> Option<String> {
+    let body = std::fs::read_to_string(path).ok()?;
+    let (deadline, text) = body.split_once('\n')?;
+    let deadline: u64 = deadline.trim().parse().ok()?;
+    if now_ms() >= deadline {
+        return None;
+    }
+    Some(text.to_string())
+}
+
+/// Remove the hint file and any staged temp beside it.
+pub fn clear_hint(path: &Path) {
+    if path.exists() {
+        let _ = std::fs::remove_file(path);
+    }
+    let staged = temp_sibling(path);
+    if staged.exists() {
+        let _ = std::fs::remove_file(&staged);
+    }
+}
+
+/// Milliseconds since the Unix epoch, saturating at 0 if the clock is
+/// somehow before it.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// Read the current preview.
@@ -131,6 +203,27 @@ mod tests {
         std::fs::write(&staged, "junk").unwrap();
         clear_preview(&p);
         assert!(!staged.exists());
+    }
+
+    #[test]
+    fn live_hint_reads_back_and_expired_hint_does_not() {
+        let p = tmp_path("hint-live");
+        write_hint(&p, "press Esc again to discard", 10_000).unwrap();
+        assert_eq!(read_hint(&p).as_deref(), Some("press Esc again to discard"));
+
+        write_hint(&p, "already gone", 0).unwrap();
+        assert_eq!(read_hint(&p), None);
+
+        clear_hint(&p);
+        assert_eq!(read_hint(&p), None);
+    }
+
+    #[test]
+    fn hint_text_may_contain_newlines() {
+        let p = tmp_path("hint-multiline");
+        write_hint(&p, "first\nsecond", 10_000).unwrap();
+        assert_eq!(read_hint(&p).as_deref(), Some("first\nsecond"));
+        clear_hint(&p);
     }
 
     #[test]

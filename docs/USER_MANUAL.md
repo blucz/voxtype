@@ -334,7 +334,21 @@ voxtype record start --file         # Write to file_path from config
 voxtype record stop                 # Stop recording and transcribe (sends SIGUSR2 to daemon)
 voxtype record toggle               # Toggle recording state
 voxtype record cancel               # Cancel recording or transcription in progress
+voxtype record cancel --double-tap  # Cancel only if pressed twice within 1.5s
 ```
+
+**Reading back what you dictated:**
+
+```bash
+voxtype transcript last             # Print the most recent transcript
+voxtype transcript last --copy      # Copy it to the clipboard
+voxtype transcript list -n 20       # Recent transcripts, ✗ marks discarded ones
+voxtype transcript path             # Path of the journal file
+```
+
+Transcripts are journalled before they are delivered, so text that landed in
+the wrong window — or that a cancel threw away — can still be recovered. See
+[transcript_journal](CONFIGURATION.md#transcript_journal).
 
 **Model override:** Use `--model` to specify which model to use for this recording:
 
@@ -754,6 +768,13 @@ Use `voxtype record cancel` bound to a key (typically Escape):
 bind = , Escape, exec, voxtype record cancel
 bind = , Escape, submap, reset
 ```
+
+Add `--double-tap` to require two presses: the first arms the cancel and shows a prompt in the OSD, and only a second press within the window (1500 ms by default, `--double-tap=800` to narrow it) discards anything. Worth it for a key as easy to hit by accident as Escape, and for dictation long enough to hurt to lose:
+```hyprlang
+bind = , Escape, exec, voxtype record cancel --double-tap
+```
+
+Note that a submap replaces the whole active bind set, so your start/stop or toggle binding stops working while the submap is active unless you repeat it inside the submap or mark it `submap_universal`.
 
 **Sway** (in your mode):
 ```

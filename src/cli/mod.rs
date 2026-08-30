@@ -12,6 +12,7 @@ mod meeting;
 mod record;
 mod root;
 mod setup;
+mod transcript;
 
 pub use commands::Commands;
 pub use config::ConfigAction;
@@ -20,6 +21,7 @@ pub use meeting::MeetingAction;
 pub use record::{OutputModeOverride, RecordAction};
 pub use root::Cli;
 pub use setup::{CompositorType, SetupAction};
+pub use transcript::TranscriptAction;
 
 /// Comma-separated list of every transcription engine name as it appears in
 /// CLI help text.

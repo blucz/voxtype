@@ -294,13 +294,29 @@ aplay test.wav
 
 ### Recording stops unexpectedly
 
-**Cause:** `max_duration_secs` limit reached.
+**Cause:** `max_duration_secs` limit reached. The daemon transcribes and delivers what it captured, so a long dictation ends mid-sentence and the text lands wherever focus happens to be.
 
-**Solution:** Increase the limit:
+**Solution:** Raise the limit, or remove it:
 ```toml
 [audio]
 max_duration_secs = 120  # 2 minutes
+max_duration_secs = 0    # no limit
 ```
+
+Text that a surprise stop delivered somewhere unhelpful is still recoverable — see [Recovering a lost transcript](#recovering-a-lost-transcript).
+
+### Recovering a lost transcript
+
+Every transcription is journalled before it is delivered, and cancelled ones are journalled too, so text that went to the wrong window is not gone:
+
+```bash
+voxtype transcript last          # print the most recent transcript
+voxtype transcript last --copy   # put it back on the clipboard
+voxtype transcript list -n 20    # recent transcripts, ✗ marks discarded ones
+voxtype transcript path          # where the journal lives
+```
+
+Turn the journal off with `output.transcript_journal = false` if transcripts should not touch disk.
 
 ---
 

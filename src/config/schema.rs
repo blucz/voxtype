@@ -721,10 +721,10 @@ pub const CONFIG_KEYS: &[KeySpec] = &[
         "audio.max_duration_secs",
         "audio",
         "max_duration_secs",
-        KeyType::Int { min: 5, max: 3600 },
+        KeyType::Int { min: 0, max: 86400 },
         "Audio",
         "Max recording length",
-        "Safety cap in seconds; recording stops on its own at this point.",
+        "Safety cap in seconds; recording stops on its own at this point. 0 removes the cap.",
     ),
     spec(
         "audio.pause_media",
@@ -816,6 +816,15 @@ pub const CONFIG_KEYS: &[KeySpec] = &[
         "Output",
         "Shift+Enter for newlines",
         "Type embedded newlines as Shift+Enter so chat apps don't submit early.",
+    ),
+    spec(
+        "output.transcript_journal",
+        "output",
+        "transcript_journal",
+        KeyType::Bool,
+        "Output",
+        "Keep a transcript journal",
+        "Record every transcription (and anything a cancel discards) so `voxtype transcript last` can recover it.",
     ),
     spec(
         "output.pre_type_delay_ms",
@@ -1634,6 +1643,7 @@ pub fn resolve(key: &str, cfg: &Config) -> Option<Json> {
         "output.fallback_to_clipboard" => json!(cfg.output.fallback_to_clipboard),
         "output.auto_submit" => json!(cfg.output.auto_submit),
         "output.shift_enter_newlines" => json!(cfg.output.shift_enter_newlines),
+        "output.transcript_journal" => json!(cfg.output.transcript_journal),
         "output.pre_type_delay_ms" => json!(cfg.output.pre_type_delay_ms),
         "output.append_text" => opt_str(cfg.output.append_text.as_ref()),
         "output.post_process.command" => match &cfg.output.post_process {
@@ -2112,8 +2122,11 @@ mod tests {
         let dur = scalar_keys()
             .find(|s| s.key == "audio.max_duration_secs")
             .unwrap();
+        // 0 is in range and means "no cap"; the range check starts biting
+        // past a day.
+        assert!(validate_value(dur, "0").is_ok());
         assert!(matches!(
-            validate_value(dur, "0"),
+            validate_value(dur, "86401"),
             Err(ValueError::OutOfRange { .. })
         ));
         assert!(matches!(
