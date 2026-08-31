@@ -14,7 +14,6 @@ use crate::hotkey::{self, HotkeyEvent};
 use crate::hotkey_macos::{self as hotkey, HotkeyEvent};
 use crate::meeting::{self, MeetingDaemon, MeetingEvent, StorageConfig};
 use crate::model_manager::ModelManager;
-#[cfg(target_os = "macos")]
 use crate::notification;
 use crate::output;
 use crate::output::post_process::PostProcessor;
@@ -25,10 +24,8 @@ use crate::text::TextProcessor;
 use crate::transcribe::{StreamHandle, StreamingEvent, Transcriber};
 use pidlock::Pidlock;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::process::Command;
 use tokio::signal::unix::{signal, SignalKind};
 
 /// Send a desktop notification with optional engine icon
@@ -51,26 +48,12 @@ async fn send_notification(
 
     #[cfg(target_os = "linux")]
     {
-        let urgency_arg = format!("--urgency={}", crate::output::sanitize_urgency(urgency));
-        // Synchronous + transient hints ([#345]): force a single Voxtype
-        // notification slot the compositor overwrites in place, and prevent
-        // status updates from accumulating in the notification history.
-        let _ = Command::new("notify-send")
-            .args([
-                "--app-name=Voxtype",
-                &urgency_arg,
-                "--expire-time=2000",
-                "-h",
-                "string:x-canonical-private-synchronous:voxtype",
-                "-h",
-                "int:transient:1",
-                &title,
-                body,
-            ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .await;
+        // Through the notification module rather than straight to
+        // notify-send: that module owns the --replace-id bookkeeping that
+        // keeps every Voxtype notification in a single slot. Posting from
+        // here directly is why status notifications carried on stacking on
+        // KDE after #532, which only fixed the module.
+        notification::send_status(&title, body, urgency, 2000).await;
     }
 
     #[cfg(target_os = "macos")]

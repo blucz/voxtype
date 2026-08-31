@@ -28,7 +28,7 @@ pub async fn send_with_engine(title: &str, body: &str, engine: Option<Transcript
     #[cfg(target_os = "linux")]
     {
         let _ = engine; // Linux doesn't use engine icons in notifications
-        send_linux(title, body).await;
+        send_linux(title, body, 2000, None).await;
     }
 
     #[cfg(target_os = "macos")]
@@ -60,18 +60,26 @@ static LAST_NOTIFICATION_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::A
 static REPLACE_UNSUPPORTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Arguments shared by both Linux paths: identity, lifetime, and the GNOME
-/// hints, which stay because they are still what suppresses stacking there.
+/// Arguments shared by both Linux paths: identity, lifetime, urgency, and the
+/// GNOME hints, which stay because they are still what suppresses stacking
+/// there.
 #[cfg(target_os = "linux")]
-fn linux_common_args(expire_ms: &str) -> Vec<String> {
-    vec![
+fn linux_common_args(expire_ms: u32, urgency: Option<&str>) -> Vec<String> {
+    let mut args = vec![
         "--app-name=Voxtype".to_string(),
         format!("--expire-time={}", expire_ms),
         "-h".to_string(),
         "string:x-canonical-private-synchronous:voxtype".to_string(),
         "-h".to_string(),
         "int:transient:1".to_string(),
-    ]
+    ];
+    if let Some(urgency) = urgency {
+        args.push(format!(
+            "--urgency={}",
+            crate::output::sanitize_urgency(urgency)
+        ));
+    }
+    args
 }
 
 /// `--replace-id <n>` for the notification we last posted, or nothing if we
@@ -98,14 +106,14 @@ fn remember_notification_id(stdout: &[u8]) {
 
 /// Send a notification on Linux using notify-send
 #[cfg(target_os = "linux")]
-async fn send_linux(title: &str, body: &str) {
+async fn send_linux(title: &str, body: &str, expire_ms: u32, urgency: Option<&str>) {
     // Synchronous + transient hints ([#345]) keep this in the same
     // overwrite slot as the daemon's recording/transcribing notifications
     // and prevent stacking in the GNOME/Ubuntu notification history.
     use std::sync::atomic::Ordering;
 
     if !REPLACE_UNSUPPORTED.load(Ordering::Relaxed) {
-        let mut args = linux_common_args("2000");
+        let mut args = linux_common_args(expire_ms, urgency);
         args.push("--print-id".to_string());
         args.extend(replace_args());
         args.push(title.to_string());
@@ -133,7 +141,7 @@ async fn send_linux(title: &str, body: &str) {
         }
     }
 
-    let mut args = linux_common_args("2000");
+    let mut args = linux_common_args(expire_ms, urgency);
     args.push(title.to_string());
     args.push(body.to_string());
     if let Err(e) = Command::new("notify-send")
@@ -145,6 +153,26 @@ async fn send_linux(title: &str, body: &str) {
     {
         tracing::debug!("Failed to send notification: {}", e);
     }
+}
+
+/// Send a status notification: the same single-slot behaviour as `send`, plus
+/// the caller's urgency and expiry.
+///
+/// Every Voxtype notification on Linux belongs here. A caller that shells out
+/// to `notify-send` itself gets a fresh ID from the server and stacks beside
+/// the previous notification instead of replacing it, which is how the daemon
+/// kept stacking on KDE long after the fix in #532.
+#[cfg(target_os = "linux")]
+pub async fn send_status(title: &str, body: &str, urgency: &str, expire_ms: u32) {
+    send_linux(title, body, expire_ms, Some(urgency)).await;
+}
+
+/// No-op off Linux: the macOS output drivers post their own completion
+/// notifications through terminal-notifier (see `output/cgevent.rs`), and
+/// there is no freedesktop server to talk to.
+#[cfg(not(target_os = "linux"))]
+pub async fn send_status(title: &str, body: &str, urgency: &str, expire_ms: u32) {
+    let _ = (title, body, urgency, expire_ms);
 }
 
 /// Send a macOS notification using terminal-notifier
@@ -257,7 +285,7 @@ fn send_linux_sync(title: &str, body: &str) {
     use std::sync::atomic::Ordering;
 
     if !REPLACE_UNSUPPORTED.load(Ordering::Relaxed) {
-        let mut args = linux_common_args("5000");
+        let mut args = linux_common_args(5000, None);
         args.push("--print-id".to_string());
         args.extend(replace_args());
         args.push(title.to_string());
@@ -280,7 +308,7 @@ fn send_linux_sync(title: &str, body: &str) {
         }
     }
 
-    let mut args = linux_common_args("5000");
+    let mut args = linux_common_args(5000, None);
     args.push(title.to_string());
     args.push(body.to_string());
     let _ = std::process::Command::new("notify-send")
@@ -331,12 +359,24 @@ mod linux_tests {
 
     #[test]
     fn common_args_carry_identity_and_gnome_hints() {
-        let args = linux_common_args("2000");
+        let args = linux_common_args(2000, None);
         assert!(args.contains(&"--app-name=Voxtype".to_string()));
         assert!(args.contains(&"--expire-time=2000".to_string()));
         // The GNOME hint stays: it is what suppresses stacking there, while
         // --replace-id is what does it on KDE.
         assert!(args.contains(&"string:x-canonical-private-synchronous:voxtype".to_string()));
+        // No urgency unless the caller asked for one, so the server keeps its
+        // own default rather than being pinned to "normal".
+        assert!(!args.iter().any(|a| a.starts_with("--urgency=")));
+    }
+
+    #[test]
+    fn common_args_carry_sanitized_urgency() {
+        let args = linux_common_args(2000, Some("critical"));
+        assert!(args.contains(&"--urgency=critical".to_string()));
+
+        let args = linux_common_args(2000, Some("nonsense"));
+        assert!(args.contains(&"--urgency=normal".to_string()));
     }
 }
 
