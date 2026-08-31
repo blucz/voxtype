@@ -216,7 +216,13 @@ pub async fn send_transcription_notification(
     // that module owns the --replace-id bookkeeping that keeps every Voxtype
     // notification in a single slot, and a notification posted from here
     // stacks beside the daemon's instead of replacing it ([#532]).
-    crate::notification::send_status(&title, &preview, urgency, 3000).await;
+    crate::notification::send_status(
+        &title,
+        &preview,
+        urgency,
+        crate::notification::Lifetime::Millis(3000),
+    )
+    .await;
 }
 
 /// Trait for text output implementations
