@@ -1297,15 +1297,51 @@ impl Daemon {
         streaming_chain: &mut Option<Vec<Box<dyn TextOutput>>>,
         notification_body: &str,
     ) {
-        let backend_task = streaming_handle.take().map(|h| {
-            let _ = h.cancel.send(());
-            h.task
-        });
+        // Close the mic first. Cutting the audio flow drops the samples
+        // sender, which the backend treats as end-of-input and flushes.
         self.cut_streaming_audio();
         if let Some(mut c) = audio_capture.take() {
             let _ = c.stop().await;
         }
         self.restore_recording_media();
+
+        // Drain what the backend still has buffered instead of aborting it.
+        // The streaming window trails speech by a second or more, so an
+        // abort would journal only what had *already* been decoded and a
+        // cancel a moment after a sentence would keep none of it. Nothing
+        // here reaches the output chain: the drained text goes only to the
+        // journal. Bounded so a wedged backend cannot hold the daemon.
+        let mut drained_finals = String::new();
+        let mut drained_partial = String::new();
+        let backend_task = match streaming_handle.take() {
+            Some(mut h) => {
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+                loop {
+                    let ev = tokio::time::timeout_at(deadline, h.events.recv()).await;
+                    match ev {
+                        Ok(Some(StreamingEvent::Partial { text, .. })) => drained_partial = text,
+                        Ok(Some(StreamingEvent::Final { text, .. })) => {
+                            drained_finals.push_str(&text);
+                            drained_partial.clear();
+                        }
+                        Ok(Some(StreamingEvent::Replace { backspace, text, .. })) => {
+                            let keep = drained_finals.chars().count().saturating_sub(backspace);
+                            drained_finals = drained_finals.chars().take(keep).collect();
+                            drained_finals.push_str(&text);
+                            drained_partial.clear();
+                        }
+                        Ok(Some(StreamingEvent::Ended)) | Ok(Some(StreamingEvent::Error(_))) | Ok(None) => break,
+                        Err(_) => {
+                            tracing::warn!("Cancel drain timed out; aborting backend");
+                            let _ = h.cancel.send(());
+                            break;
+                        }
+                    }
+                }
+                Some(h.task)
+            }
+            None => None,
+        };
         if let Some(task) = backend_task {
             let _ = task.await;
         }
@@ -1318,7 +1354,12 @@ impl Daemon {
         // lose a long dictation on purpose, which makes it exactly the
         // case worth being able to undo.
         if let Some(s) = streaming_session.as_ref() {
-            let discarded = format!("{}{}", s.finalized_text(), s.partial());
+            let tail = if drained_finals.is_empty() && drained_partial.is_empty() {
+                s.partial().to_string()
+            } else {
+                format!("{}{}", drained_finals, drained_partial)
+            };
+            let discarded = format!("{}{}", s.finalized_text(), tail);
             self.journal(crate::journal::Outcome::Cancelled, &discarded);
         }
         self.stop_streaming_drain_pump();
