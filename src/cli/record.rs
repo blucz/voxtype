@@ -301,7 +301,7 @@ impl RecordAction {
     pub fn suppress_osd(&self) -> bool {
         match self {
             RecordAction::Start { no_osd, .. } | RecordAction::Toggle { no_osd, .. } => *no_osd,
-            RecordAction::Stop { .. } | RecordAction::Cancel => false,
+            RecordAction::Stop { .. } | RecordAction::Cancel { .. } => false,
         }
     }
 
