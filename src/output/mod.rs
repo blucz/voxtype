@@ -24,6 +24,7 @@ pub mod cgevent;
 pub mod clipboard;
 pub mod dotool;
 pub mod eitype;
+pub mod focus;
 // modifier_guard is evdev-based; macOS has its own osascript modifier handling.
 #[cfg(target_os = "linux")]
 pub mod modifier_guard;
@@ -513,6 +514,14 @@ pub async fn output_with_fallback(
     // Try each output method
     let mut result = Err(OutputError::AllMethodsFailed);
     for output in chain {
+        if is_keystroke_method(output.name()) && !focus::permits_delivery().await {
+            crate::notification::send(
+                "Voxtype",
+                "Window changed after Stop. Dictation saved to clipboard and corral.",
+            )
+            .await;
+            skip_keystroke_methods = true;
+        }
         if skip_keystroke_methods && is_keystroke_method(output.name()) {
             tracing::debug!(
                 "{} skipped (modifier still held), trying next",

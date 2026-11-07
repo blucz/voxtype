@@ -241,10 +241,19 @@ impl StreamingSession {
         let opts = OutputOptions {
             pre_output_command,
             post_output_command,
-            wait_for_modifier_release: false,
-            modifier_release_timeout: std::time::Duration::from_millis(0),
+            // A preview-only commit happens after Stop. The toggle chord
+            // may still be held; allow its modifiers to be released first.
+            wait_for_modifier_release: self.preview_only,
+            modifier_release_timeout: std::time::Duration::from_millis(750),
         };
-        output_with_fallback(chain, text, opts).await?;
+        if let Err(error) = output_with_fallback(chain, text, opts).await {
+            if self.preview_only {
+                // Keep the complete utterance recoverable if all delivery
+                // methods fail. Ended will journal this pending buffer.
+                self.partial = text.to_owned();
+            }
+            return Err(error);
+        }
 
         self.typed_chars += text.chars().count();
         // Treat the partial-stream-so-far plus this final tail as the
@@ -328,8 +337,8 @@ impl StreamingSession {
             let opts = OutputOptions {
                 pre_output_command,
                 post_output_command,
-                wait_for_modifier_release: false,
-                modifier_release_timeout: std::time::Duration::from_millis(0),
+                wait_for_modifier_release: self.preview_only,
+                modifier_release_timeout: std::time::Duration::from_millis(750),
             };
             output_with_fallback(chain, text, opts).await?;
             self.typed_chars += text.chars().count();
@@ -593,6 +602,26 @@ mod tests {
     }
 
     // ---- preview-only policy ----
+
+    #[tokio::test]
+    async fn failed_delivery_keeps_the_whole_preview_for_recovery() {
+        let mut s = StreamingSession::new_preview_only();
+        s.type_partial_delta(&[], "hello".into(), None, None)
+            .await
+            .unwrap();
+        assert!(s
+            .commit_segment(&[], " world", None, None, None)
+            .await
+            .is_err());
+        assert_eq!(s.partial(), "hello world");
+        assert_eq!(s.typed_chars(), 0);
+        let out = std::sync::Arc::new(RecordingOutput::new());
+        s.commit_segment(&chain_with(out.clone()), "", None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(out.typed(), vec!["hello world"]);
+        assert_eq!(s.finalized_text(), "hello world");
+    }
 
     #[tokio::test]
     async fn preview_only_withholds_partials_from_the_cursor() {

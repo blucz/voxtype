@@ -220,7 +220,6 @@ impl StreamingTranscriber for ParakeetStreamingTranscriber {
         let (cancel_tx, mut cancel_rx) = oneshot::channel::<()>();
 
         let task = tokio::task::spawn_blocking(move || -> Result<(), TranscribeError> {
-            let mut last_text = String::new();
             let segment_id: u64 = 0;
             let runtime = tokio::runtime::Handle::current();
 
@@ -270,7 +269,6 @@ impl StreamingTranscriber for ParakeetStreamingTranscriber {
                 // "very very" or "that that" decoded two identical
                 // deltas and only the first survived.
                 if !text.is_empty() {
-                    last_text = text.clone();
                     let _ = runtime
                         .block_on(events_tx.send(StreamingEvent::Partial { text, segment_id }));
                 }
@@ -279,10 +277,15 @@ impl StreamingTranscriber for ParakeetStreamingTranscriber {
             // Drain any buffered audio with flush() on close.
             tracing::debug!("Parakeet streaming: flushing");
             let final_text = match unified.flush() {
-                Ok(t) => t.trim().to_string(),
+                // SentencePiece carries word boundaries as leading spaces.
+                // This is a delta: trimming it glues the final words onto
+                // the preceding chunk ("hello" + " world" => "helloworld").
+                Ok(t) => t,
                 Err(e) => {
                     tracing::warn!("ParakeetUnified::flush failed: {}", e);
-                    last_text.trim().to_string()
+                    // The last emitted chunk is already in the preview.
+                    // Replaying it would duplicate speech on a flush error.
+                    String::new()
                 }
             };
 
@@ -290,13 +293,7 @@ impl StreamingTranscriber for ParakeetStreamingTranscriber {
                 final_len = final_text.len(),
                 "Parakeet streaming: flush complete, emitting Final+Ended"
             );
-            if !final_text.is_empty() {
-                let _ = runtime.block_on(events_tx.send(StreamingEvent::Final {
-                    text: final_text,
-                    segment_id,
-                }));
-            }
-            let _ = runtime.block_on(events_tx.send(StreamingEvent::Ended));
+            runtime.block_on(finish_stream(&events_tx, final_text, segment_id));
             Ok(())
         });
 
@@ -320,9 +317,38 @@ impl StreamingTranscriber for ParakeetStreamingTranscriber {
     }
 }
 
+async fn finish_stream(events: &mpsc::Sender<StreamingEvent>, tail: String, segment_id: u64) {
+    if !tail.is_empty() {
+        let _ = events
+            .send(StreamingEvent::Final {
+                text: tail,
+                segment_id,
+            })
+            .await;
+    }
+    let _ = events.send(StreamingEvent::Ended).await;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn final_delta_keeps_word_boundaries_and_split_words() {
+        for (prefix, tail, expected) in [
+            ("hello", " world", "hello world"),
+            ("trans", "cription", "transcription"),
+            ("hello", ", world", "hello, world"),
+        ] {
+            let (tx, mut rx) = mpsc::channel(2);
+            finish_stream(&tx, tail.to_owned(), 0).await;
+            let Some(StreamingEvent::Final { text, .. }) = rx.recv().await else {
+                panic!("missing final")
+            };
+            assert_eq!(format!("{prefix}{text}"), expected);
+            assert!(matches!(rx.recv().await, Some(StreamingEvent::Ended)));
+        }
+    }
 
     /// Smoke test that the type and trait signatures compile. Real model-
     /// driven tests require ONNX runtime + a downloaded model and live in

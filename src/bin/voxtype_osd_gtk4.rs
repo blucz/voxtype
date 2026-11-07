@@ -15,8 +15,9 @@
 //!
 //! Run with `RUST_LOG=debug` for verbose logs.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -107,7 +108,6 @@ const PREVIEW_LINE_FACTOR: f64 = 1.38;
 
 /// Inner padding of the text/pill panels, in pixels.
 const PANEL_PAD_X: f64 = 16.0;
-const PANEL_PAD_Y: f64 = 12.0;
 
 /// Corner radius for the text/pill panels.
 const PANEL_RADIUS: f64 = 12.0;
@@ -117,8 +117,8 @@ const PANEL_RADIUS: f64 = 12.0;
 /// transcript, so text mode substitutes a panel proportioned for a few
 /// lines. An explicit width/height in config or on the CLI still wins —
 /// see `apply_text_mode_sizing`.
-const TEXT_MODE_WIDTH: u32 = 560;
-const TEXT_MODE_HEIGHT: u32 = 132;
+const TEXT_MODE_WIDTH: u32 = 480;
+const TEXT_MODE_HEIGHT: u32 = 82;
 
 #[derive(Parser, Debug, Clone)]
 #[command(
@@ -166,6 +166,227 @@ struct Args {
     /// Reduce for hot mics (e.g. 4.0); raise for quiet sources (e.g. 14.0).
     #[arg(long, env = "VOXTYPE_OSD_GAIN")]
     waveform_gain: Option<f32>,
+}
+
+/// Small user-owned layout state, independent of the dictation session.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+struct PanelLayout {
+    left_fraction: f64,
+    top_px: i32,
+    collapsed: bool,
+}
+impl Default for PanelLayout {
+    fn default() -> Self {
+        Self {
+            left_fraction: 0.5,
+            top_px: 32,
+            collapsed: false,
+        }
+    }
+}
+fn layout_path() -> PathBuf {
+    std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))
+        .unwrap_or_else(std::env::temp_dir)
+        .join("voxtype/osd-layout.json")
+}
+fn load_layout() -> PanelLayout {
+    std::fs::read(layout_path())
+        .ok()
+        .and_then(|s| serde_json::from_slice(&s).ok())
+        .unwrap_or_default()
+}
+fn save_layout(layout: &PanelLayout) {
+    let path = layout_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(bytes) = serde_json::to_vec(layout) {
+        let staged = path.with_extension("tmp");
+        if std::fs::write(&staged, bytes).is_ok() {
+            let _ = std::fs::rename(staged, path);
+        }
+    }
+}
+fn panel_bounds(window: &ApplicationWindow) -> (i32, i32) {
+    let monitor = window.monitor().or_else(|| {
+        window
+            .surface()
+            .and_then(|s| s.display().monitor_at_surface(&s))
+    });
+    monitor
+        .map(|m| (m.geometry().width(), m.geometry().height()))
+        .unwrap_or((1920, 1080))
+}
+fn panel_geometry(
+    layout: &PanelLayout,
+    screen: (i32, i32),
+    expanded: (i32, i32),
+) -> (i32, i32, i32, i32) {
+    let (sw, sh) = screen;
+    let (w, h) = if layout.collapsed {
+        (240, 34)
+    } else {
+        expanded
+    };
+    let w = w.min((sw - 8).max(1));
+    let h = h.min((sh - 8).max(1));
+    let fraction = if layout.left_fraction.is_finite() {
+        layout.left_fraction.clamp(0.0, 1.0)
+    } else {
+        0.5
+    };
+    let x = ((sw - w).max(0) as f64 * fraction).round() as i32;
+    let y = layout.top_px.clamp(0, (sh - h).max(0));
+    (x, y, w, h)
+}
+fn place_panel(
+    window: &ApplicationWindow,
+    area: &DrawingArea,
+    layout: &PanelLayout,
+    expanded: (i32, i32),
+) {
+    let (x, y, w, h) = panel_geometry(layout, panel_bounds(window), expanded);
+    window.set_anchor(Edge::Top, true);
+    window.set_anchor(Edge::Bottom, false);
+    window.set_anchor(Edge::Left, true);
+    window.set_anchor(Edge::Right, false);
+    window.set_exclusive_zone(-1);
+    window.set_margin(Edge::Left, x);
+    window.set_margin(Edge::Right, 0);
+    window.set_margin(Edge::Top, y);
+    window.set_margin(Edge::Bottom, 0);
+    area.set_content_width(w);
+    area.set_content_height(h);
+    window.set_default_size(w, h);
+    area.queue_draw();
+}
+fn panel_input_region(window: &ApplicationWindow, width: i32) {
+    if let Some(surface) = window.surface() {
+        // Only the grip and collapse button receive clicks. Text and audio
+        // feedback remain transparent to the application underneath.
+        let region = Region::create_rectangle(&RectangleInt::new(0, 0, 28, 28));
+        let _ = region.union_rectangle(&RectangleInt::new((width - 32).max(0), 0, 32, 28));
+        surface.set_input_region(Some(&region));
+    }
+}
+/// Absolute cursor coordinates do not change when the layer surface moves.
+/// GTK drag offsets are surface-relative and feed our own movement back into
+/// the next event, producing oscillation/half-speed movement on Wayland.
+fn hypr_cursor_position() -> Option<(f64, f64)> {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+    let socket = PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR")?)
+        .join("hypr")
+        .join(std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE")?)
+        .join(".socket.sock");
+    let mut connection = UnixStream::connect(socket).ok()?;
+    connection
+        .set_read_timeout(Some(Duration::from_millis(5)))
+        .ok()?;
+    connection
+        .set_write_timeout(Some(Duration::from_millis(5)))
+        .ok()?;
+    connection.write_all(b"j/cursorpos").ok()?;
+    let mut reply = Vec::new();
+    let mut block = [0u8; 128];
+    while reply.len() < 512 {
+        let n = connection.read(&mut block).ok()?;
+        if n == 0 {
+            break;
+        }
+        reply.extend_from_slice(&block[..n]);
+        if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&reply) {
+            return Some((value.get("x")?.as_f64()?, value.get("y")?.as_f64()?));
+        }
+    }
+    None
+}
+
+#[derive(Clone, Copy)]
+struct PanelDrag {
+    panel: (i32, i32),
+    cursor: (f64, f64),
+}
+
+fn panel_controls(
+    window: &ApplicationWindow,
+    area: &DrawingArea,
+    layout: Rc<RefCell<PanelLayout>>,
+    expanded: (i32, i32),
+) {
+    panel_controls_with_cursor(
+        window,
+        area,
+        layout,
+        expanded,
+        Rc::new(hypr_cursor_position),
+    );
+}
+
+fn panel_controls_with_cursor(
+    window: &ApplicationWindow,
+    area: &DrawingArea,
+    layout: Rc<RefCell<PanelLayout>>,
+    expanded: (i32, i32),
+    cursor_position: Rc<dyn Fn() -> Option<(f64, f64)>>,
+) {
+    place_panel(window, area, &layout.borrow(), expanded);
+    let w = window.clone();
+    area.connect_resize(move |_, width, _| panel_input_region(&w, width));
+    let click = gtk4::GestureClick::new();
+    let (w, a, l) = (window.clone(), area.clone(), layout.clone());
+    click.connect_released(move |_, _, x, y| {
+        if y <= 28.0 && x >= f64::from(a.width() - 32) {
+            let mut l = l.borrow_mut();
+            l.collapsed = !l.collapsed;
+            place_panel(&w, &a, &l, expanded);
+            save_layout(&l);
+        }
+    });
+    area.add_controller(click);
+    let drag = gtk4::GestureDrag::new();
+    let origin = Rc::new(Cell::new(None::<PanelDrag>));
+    let read_cursor = cursor_position.clone();
+    let (w, l, o) = (window.clone(), layout.clone(), origin.clone());
+    drag.connect_drag_begin(move |g, x, y| {
+        if x > 28.0 || y > 28.0 {
+            g.set_state(gtk4::EventSequenceState::Denied);
+            return;
+        }
+        let Some(cursor) = read_cursor() else {
+            g.set_state(gtk4::EventSequenceState::Denied);
+            return;
+        };
+        let (x, y, _, _) = panel_geometry(&l.borrow(), panel_bounds(&w), expanded);
+        o.set(Some(PanelDrag {
+            panel: (x, y),
+            cursor,
+        }));
+    });
+    let (w, a, l, o) = (window.clone(), area.clone(), layout.clone(), origin);
+    drag.connect_drag_update(move |_, _surface_dx, _surface_dy| {
+        let Some(anchor) = o.get() else {
+            return;
+        };
+        let Some(cursor) = cursor_position() else {
+            return;
+        };
+        let dx = cursor.0 - anchor.cursor.0;
+        let dy = cursor.1 - anchor.cursor.1;
+        let screen = panel_bounds(&w);
+        let (_, _, width, _) = panel_geometry(&l.borrow(), screen, expanded);
+        let (x, y) = anchor.panel;
+        let mut l = l.borrow_mut();
+        l.left_fraction =
+            ((f64::from(x) + dx) / f64::from((screen.0 - width).max(1))).clamp(0.0, 1.0);
+        l.top_px = (f64::from(y) + dy).round() as i32;
+        place_panel(&w, &a, &l, expanded);
+    });
+    drag.connect_drag_end(move |_, _, _| save_layout(&layout.borrow()));
+    area.add_controller(drag);
 }
 
 /// State shared between the IPC worker and the GTK redraw timer.
@@ -406,6 +627,15 @@ fn build_window(app: &Application, cfg: &OsdConfig, palette: Palette, state: Arc
         .decorated(false)
         .build();
 
+    window.add_css_class("voxtype-osd");
+    let css = gtk4::CssProvider::new();
+    css.load_from_data("window.voxtype-osd { background: transparent; box-shadow: none; }");
+    gtk4::style_context_add_provider_for_display(
+        &gtk4::prelude::WidgetExt::display(&window),
+        &css,
+        gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
+    );
+
     // Layer-shell setup: top layer, no keyboard, anchored per config.
     window.init_layer_shell();
     window.set_layer(Layer::Overlay);
@@ -511,8 +741,18 @@ fn build_window(app: &Application, cfg: &OsdConfig, palette: Palette, state: Arc
     let state_for_draw = state.clone();
     let gain = cfg.waveform_gain as f64;
     let visual_mode = cfg.visual_mode;
+    let panel_layout = Rc::new(RefCell::new(load_layout()));
+    let draw_layout = panel_layout.clone();
     drawing_area.set_draw_func(move |_area, cr, w, h| {
-        draw(cr, w, h, &palette, &state_for_draw, gain, visual_mode);
+        draw(
+            cr,
+            w,
+            h,
+            &palette,
+            &state_for_draw,
+            gain,
+            (visual_mode, draw_layout.borrow().collapsed),
+        );
     });
     window.set_child(Some(&drawing_area));
 
@@ -521,8 +761,21 @@ fn build_window(app: &Application, cfg: &OsdConfig, palette: Palette, state: Arc
     {
         let window_ref = window.clone();
         window.connect_realize(move |_| {
-            apply_click_through(&window_ref);
+            if visual_mode == OsdVisualMode::Text {
+                panel_input_region(&window_ref, window_ref.width());
+            } else {
+                apply_click_through(&window_ref);
+            }
         });
+    }
+
+    if visual_mode == OsdVisualMode::Text {
+        panel_controls(
+            &window,
+            &drawing_area,
+            panel_layout.clone(),
+            (cfg.width_px as i32, cfg.height_px as i32),
+        );
     }
 
     // Redraw timer. We only call queue_draw() when the IPC has produced a
@@ -531,6 +784,10 @@ fn build_window(app: &Application, cfg: &OsdConfig, palette: Palette, state: Arc
     let redraw_area = drawing_area.clone();
     let redraw_window = window.clone();
     let last_drawn_seq = Cell::new(0u64);
+    let show_layout = panel_layout.clone();
+    let expanded_size = (cfg.width_px as i32, cfg.height_px as i32);
+    let last_bounds = Cell::new(panel_bounds(&window));
+    let bounds_checked = Cell::new(Instant::now());
     // Preview polling state. The file is only consulted in text mode, and
     // only while frames are flowing, so an idle daemon costs nothing.
     let preview_mode = cfg.visual_mode == OsdVisualMode::Text;
@@ -547,6 +804,18 @@ fn build_window(app: &Application, cfg: &OsdConfig, palette: Palette, state: Arc
     let visible = Cell::new(true);
 
     glib::timeout_add_local(Duration::from_millis(RENDER_TICK_MS as u64), move || {
+        if preview_mode && bounds_checked.get().elapsed() >= Duration::from_millis(500) {
+            bounds_checked.set(Instant::now());
+            let bounds = panel_bounds(&redraw_window);
+            if bounds != last_bounds.replace(bounds) {
+                place_panel(
+                    &redraw_window,
+                    &redraw_area,
+                    &show_layout.borrow(),
+                    expanded_size,
+                );
+            }
+        }
         let cur_seq = redraw_state.last_seq.lock().map(|s| *s).unwrap_or(0);
         let last_at = redraw_state
             .last_frame_at
@@ -604,6 +873,14 @@ fn build_window(app: &Application, cfg: &OsdConfig, palette: Palette, state: Arc
         }
 
         if !visible.get() {
+            if preview_mode {
+                place_panel(
+                    &redraw_window,
+                    &redraw_area,
+                    &show_layout.borrow(),
+                    expanded_size,
+                );
+            }
             tracing::info!(
                 "showing (frame seq={}, last_at={:.3}s ago)",
                 cur_seq,
@@ -670,8 +947,9 @@ fn draw(
     palette: &Palette,
     state: &Arc<SharedState>,
     gain: f64,
-    mode: OsdVisualMode,
+    presentation: (OsdVisualMode, bool),
 ) {
+    let (mode, collapsed) = presentation;
     let w = width as f64;
     let h = height as f64;
     if w <= 0.0 || h <= 0.0 {
@@ -697,16 +975,23 @@ fn draw(
             draw_peak_meter(cr, wave_width + gap, 0.0, meter_width, h, palette, state);
         }
         OsdVisualMode::Text => {
-            // Square-cornered fill across the whole surface. Omarchy is
-            // crisp-cornered throughout, and rounding this panel while it
-            // is pinned to the top edge left slivers of desktop showing at
-            // the lower corners, so the notch is drawn as a plain rect.
-            cr.set_source_rgba(bg.r as f64, bg.g as f64, bg.b as f64, bg.a as f64);
             cr.set_operator(cairo::Operator::Source);
+            cr.set_source_rgba(0.0, 0.0, 0.0, 0.0);
             cr.paint().ok();
             cr.set_operator(cairo::Operator::Over);
-
-            draw_text_preview(cr, w, h, palette, state);
+            rounded_rect(cr, 0.0, 0.0, w, h, PANEL_RADIUS);
+            cr.set_source_rgba(bg.r as f64, bg.g as f64, bg.b as f64, bg.a as f64);
+            cr.fill().ok();
+            rounded_rect(cr, 0.5, 0.5, w - 1.0, h - 1.0, PANEL_RADIUS);
+            cr.set_source_rgba(
+                palette.foreground.r as f64,
+                palette.foreground.g as f64,
+                palette.foreground.b as f64,
+                0.16,
+            );
+            cr.set_line_width(1.0);
+            cr.stroke().ok();
+            draw_text_preview(cr, w, h, palette, state, collapsed);
         }
         OsdVisualMode::Pill => {
             // A pill keeps its capsule silhouette — that is the whole
@@ -794,15 +1079,6 @@ fn wrap_text(cr: &Context, text: &str, max_w: f64) -> Vec<String> {
     lines
 }
 
-/// Width of the left gutter in the text panel: the status dot with the
-/// elapsed clock beneath it. Wide enough for "MM:SS" at [`CLOCK_FONT_SIZE`],
-/// and for "H:MM:SS" past the hour without the text column shifting.
-const GUTTER_W: f64 = 46.0;
-
-/// Font size of the elapsed clock. Deliberately much smaller than the
-/// transcript: it is a reassurance, not something to read.
-const CLOCK_FONT_SIZE: f64 = 10.0;
-
 /// Upper bound on transcript characters handed to [`wrap_text`].
 ///
 /// Only the last few lines are ever drawn, but wrapping measures every
@@ -851,108 +1127,109 @@ fn format_elapsed(d: Duration) -> String {
 /// decodes, the panel shows a listening line over the amplitude pill so
 /// the user still gets mic feedback. An armed hint, when present, takes
 /// the bottom line.
-fn draw_text_preview(cr: &Context, w: f64, h: f64, palette: &Palette, state: &Arc<SharedState>) {
+fn draw_text_preview(
+    cr: &Context,
+    w: f64,
+    h: f64,
+    palette: &Palette,
+    state: &Arc<SharedState>,
+    collapsed: bool,
+) {
     let fg = palette.foreground;
     let accent = palette.accent;
-
     cr.select_font_face(
         "sans-serif",
         cairo::FontSlant::Normal,
         cairo::FontWeight::Normal,
     );
-    cr.set_font_size(PREVIEW_FONT_SIZE);
-
-    // Status dot, sized by live amplitude so the panel still breathes
-    // with the voice without a scrolling waveform.
-    let level = current_level(state);
-    let dot_cx = PANEL_PAD_X + 5.0;
-    let dot_cy = PANEL_PAD_Y + PREVIEW_FONT_SIZE * 0.55;
-    let dot_r = 3.5 + level * 2.5;
-    cr.set_source_rgba(accent.r as f64, accent.g as f64, accent.b as f64, 0.95);
-    cr.arc(dot_cx, dot_cy, dot_r, 0.0, std::f64::consts::PI * 2.0);
-    cr.fill().ok();
-
-    // Elapsed clock under the dot. Without it a long dictation gives no
-    // sign of how long it has been running — and no way to notice that it
-    // is still running at all.
-    let started = state.session_started.lock().ok().and_then(|t| *t);
-    if let Some(started) = started {
-        cr.set_font_size(CLOCK_FONT_SIZE);
-        cr.set_source_rgba(fg.r as f64, fg.g as f64, fg.b as f64, 0.5);
-        cr.move_to(PANEL_PAD_X, dot_cy + CLOCK_FONT_SIZE + 7.0);
-        cr.show_text(&format_elapsed(started.elapsed())).ok();
-        cr.set_font_size(PREVIEW_FONT_SIZE);
-    }
-
-    let text_x = PANEL_PAD_X + GUTTER_W;
-    let max_w = (w - text_x - PANEL_PAD_X).max(1.0);
-    if max_w < 1.0 {
-        return;
-    }
-
-    let line_h = PREVIEW_FONT_SIZE * PREVIEW_LINE_FACTOR;
-
-    // An armed hint owns the bottom line; the transcript gives it up.
-    let hint = state.hint.lock().ok().and_then(|hh| hh.clone());
-    if let Some(ref hint) = hint {
-        cr.set_source_rgba(accent.r as f64, accent.g as f64, accent.b as f64, 0.95);
-        cr.move_to(text_x, h - PANEL_PAD_Y);
-        cr.show_text(hint).ok();
-    }
-    let reserved_h = if hint.is_some() { line_h } else { 0.0 };
-
-    let preview = state.preview.lock().ok().and_then(|p| p.clone());
-    let text = preview.unwrap_or_default();
-    let trimmed = text.trim();
-
-    if trimmed.is_empty() {
-        // Nothing decoded yet (or no streaming session). Show a quiet
-        // placeholder plus the pill, so the surface is never a blank box.
-        cr.set_source_rgba(fg.r as f64, fg.g as f64, fg.b as f64, 0.45);
-        cr.move_to(text_x, PANEL_PAD_Y + PREVIEW_FONT_SIZE);
-        cr.show_text("Listening…").ok();
-
-        let pill_h = 6.0;
-        let pill_y = h - PANEL_PAD_Y - pill_h - reserved_h;
-        draw_pill_bar(cr, text_x, pill_y, max_w, pill_h, palette, level);
-        return;
-    }
-
-    let avail_h = h - PANEL_PAD_Y * 2.0 - reserved_h;
-    let max_lines = ((avail_h / line_h).floor() as usize).max(1);
-
-    let lines = wrap_text(cr, wrap_tail(trimmed, WRAP_TAIL_CHARS), max_w);
-    let start = lines.len().saturating_sub(max_lines);
-    let visible = &lines[start..];
-
-    for (i, line) in visible.iter().enumerate() {
-        // Ramp older visible lines down toward 0.55 alpha; the newest
-        // line always renders at full strength.
-        let alpha = if visible.len() > 1 {
-            0.55 + 0.45 * (i as f64 / (visible.len() - 1) as f64)
-        } else {
-            1.0
-        };
-        cr.set_source_rgba(fg.r as f64, fg.g as f64, fg.b as f64, alpha);
-        let baseline = PANEL_PAD_Y + PREVIEW_FONT_SIZE + line_h * i as f64;
-        cr.move_to(text_x, baseline);
-        cr.show_text(line).ok();
-
-        // Caret after the final line: this text is still being revised.
-        if i + 1 == visible.len() {
-            let adv = cr.text_extents(line).map(|e| e.x_advance()).unwrap_or(0.0);
-            let caret_x = text_x + adv + 3.0;
-            if caret_x < w - PANEL_PAD_X {
-                cr.set_source_rgba(accent.r as f64, accent.g as f64, accent.b as f64, 0.85);
-                cr.rectangle(
-                    caret_x,
-                    baseline - PREVIEW_FONT_SIZE * 0.78,
-                    2.0,
-                    PREVIEW_FONT_SIZE * 0.92,
-                );
-                cr.fill().ok();
-            }
+    cr.set_source_rgba(fg.r as f64, fg.g as f64, fg.b as f64, 0.65);
+    for x in [10.0, 15.0] {
+        for y in [10.0, 15.0, 20.0] {
+            cr.arc(x, y, 1.0, 0.0, std::f64::consts::TAU);
+            cr.fill().ok();
         }
+    }
+    cr.set_font_size(12.0);
+    cr.move_to(32.0, 20.0);
+    let cancel_hint = state.hint.lock().ok().and_then(|h| h.clone());
+    let armed_collapsed = collapsed && cancel_hint.is_some();
+    if armed_collapsed {
+        cr.show_text("Ctrl+Esc again").ok();
+    } else if let Some(started) = state.session_started.lock().ok().and_then(|t| *t) {
+        cr.show_text(&format_elapsed(started.elapsed())).ok();
+    }
+    let level = state
+        .ring
+        .lock()
+        .ok()
+        .and_then(|r| r.latest())
+        .map(|f| peak_meter_fraction(f.peak_dbfs, METER_FLOOR_DBFS) as f64)
+        .unwrap_or(0.0);
+    cr.set_source_rgba(accent.r as f64, accent.g as f64, accent.b as f64, 0.95);
+    for (i, scale) in [0.45, 0.8, 1.0, 0.8, 0.45].iter().enumerate() {
+        let bar_h = 3.0 + 13.0 * level * scale;
+        rounded_rect(
+            cr,
+            w - 77.0 + i as f64 * 6.0,
+            16.0 - bar_h / 2.0,
+            3.0,
+            bar_h,
+            1.5,
+        );
+        cr.fill().ok();
+    }
+    cr.set_source_rgba(fg.r as f64, fg.g as f64, fg.b as f64, 0.8);
+    cr.set_line_width(1.5);
+    cr.move_to(w - 23.0, 15.0);
+    cr.line_to(w - 13.0, 15.0);
+    if collapsed {
+        cr.move_to(w - 18.0, 10.0);
+        cr.line_to(w - 18.0, 20.0);
+    }
+    cr.stroke().ok();
+    if collapsed {
+        return;
+    }
+    cr.set_font_size(PREVIEW_FONT_SIZE);
+    let preview = state
+        .preview
+        .lock()
+        .ok()
+        .and_then(|p| p.clone())
+        .unwrap_or_default();
+    let text = if preview.trim().is_empty() {
+        "Listening…"
+    } else {
+        preview.trim()
+    };
+    let lines = wrap_text(
+        cr,
+        wrap_tail(text, WRAP_TAIL_CHARS),
+        (w - 2.0 * PANEL_PAD_X).max(1.0),
+    );
+    let visible = &lines[lines.len().saturating_sub(2)..];
+    let hint = state.hint.lock().ok().and_then(|h| h.clone());
+    for (i, line) in visible.iter().enumerate() {
+        if hint.is_some() && i == 1 {
+            break;
+        }
+        cr.set_source_rgba(
+            fg.r as f64,
+            fg.g as f64,
+            fg.b as f64,
+            if i + 1 == visible.len() { 1.0 } else { 0.65 },
+        );
+        cr.move_to(
+            PANEL_PAD_X,
+            45.0 + i as f64 * PREVIEW_FONT_SIZE * PREVIEW_LINE_FACTOR,
+        );
+        cr.show_text(line).ok();
+    }
+    if let Some(hint) = hint {
+        cr.set_font_size(12.0);
+        cr.set_source_rgba(accent.r as f64, accent.g as f64, accent.b as f64, 1.0);
+        cr.move_to(PANEL_PAD_X, h - 12.0);
+        cr.show_text(&hint).ok();
     }
 }
 
@@ -1166,6 +1443,118 @@ fn draw_peak_meter(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires a Wayland session; use an isolated XDG_STATE_HOME"]
+    fn gtk_collapse_and_drag_controls_update_layout() {
+        gtk4::init().unwrap();
+        let app = Application::builder()
+            .application_id("io.voxtype.PanelControlsTest")
+            .flags(gtk4::gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(None::<&gtk4::gio::Cancellable>).unwrap();
+        let window = ApplicationWindow::builder().application(&app).build();
+        window.init_layer_shell();
+        let area = DrawingArea::new();
+        window.set_child(Some(&area));
+        let layout = Rc::new(RefCell::new(PanelLayout::default()));
+        let cursor = Rc::new(Cell::new((1000.0, 400.0)));
+        let simulated_cursor = cursor.clone();
+        panel_controls_with_cursor(
+            &window,
+            &area,
+            layout.clone(),
+            (480, 82),
+            Rc::new(move || Some(simulated_cursor.get())),
+        );
+        area.allocate(480, 82, -1, None);
+        let controllers = area.observe_controllers();
+        for i in 0..controllers.n_items() {
+            if let Some(click) = controllers.item(i).and_downcast::<gtk4::GestureClick>() {
+                click.emit_by_name::<()>("released", &[&1i32, &462.0f64, &15.0f64]);
+            }
+        }
+        assert!(layout.borrow().collapsed);
+        for i in 0..controllers.n_items() {
+            if let Some(drag) = controllers.item(i).and_downcast::<gtk4::GestureDrag>() {
+                drag.emit_by_name::<()>("drag-begin", &[&12.0f64, &12.0f64]);
+                cursor.set((1100.0, 480.0));
+                drag.emit_by_name::<()>("drag-update", &[&100.0f64, &80.0f64]);
+                assert_eq!(layout.borrow().top_px, 112);
+                let first_x = layout.borrow().left_fraction;
+                // The panel moved beneath the pointer, changing local
+                // coordinates: the global cursor still moves another 20px.
+                cursor.set((1120.0, 500.0));
+                drag.emit_by_name::<()>("drag-update", &[&20.0f64, &20.0f64]);
+                assert_eq!(layout.borrow().top_px, 132);
+                assert!(layout.borrow().left_fraction > first_x);
+                // Moving the surface with the mouse stationary must not
+                // move the panel back or keep chasing stale local offsets.
+                let stable_x = layout.borrow().left_fraction;
+                drag.emit_by_name::<()>("drag-update", &[&0.0f64, &0.0f64]);
+                assert_eq!(layout.borrow().top_px, 132);
+                assert_eq!(layout.borrow().left_fraction, stable_x);
+                drag.emit_by_name::<()>("drag-end", &[&0.0f64, &0.0f64]);
+            }
+        }
+        assert_eq!(layout.borrow().top_px, 132);
+        assert!(layout.borrow().left_fraction > 0.5);
+        assert!(load_layout().collapsed);
+        assert_eq!(load_layout().top_px, 132);
+        window.close();
+    }
+
+    #[test]
+    fn dragged_layout_stays_visible_after_undocking() {
+        let layout = PanelLayout {
+            left_fraction: 0.98,
+            top_px: 1800,
+            collapsed: false,
+        };
+        let (x, y, w, h) = panel_geometry(&layout, (1280, 800), (480, 82));
+        assert!(x >= 0 && y >= 0 && x + w <= 1280 && y + h <= 800);
+        let layout = PanelLayout {
+            collapsed: true,
+            ..layout
+        };
+        let (_, _, w, h) = panel_geometry(&layout, (1280, 800), (480, 82));
+        assert_eq!((w, h), (240, 34));
+    }
+
+    #[test]
+    fn compact_panel_renders_transparent_corners_and_plain_transcript() {
+        let state = Arc::new(SharedState::new(6.0));
+        *state.preview.lock().unwrap()=Some("This is a longer dictation preview. Only the two most recent lines stay visible while you use the rest of the desktop. <b>Speech remains plain text.</b>".into());
+        *state.session_started.lock().unwrap() = Some(Instant::now() - Duration::from_secs(3725));
+        state.ring.lock().unwrap().push(AudioFrame {
+            seq: 1,
+            min: -0.3,
+            max: 0.3,
+            peak_dbfs: -12.0,
+        });
+        for (name, w, h, collapsed) in [("expanded", 480, 82, false), ("collapsed", 240, 34, true)]
+        {
+            let mut surface = cairo::ImageSurface::create(cairo::Format::ARgb32, w, h).unwrap();
+            let cr = Context::new(&surface).unwrap();
+            draw(
+                &cr,
+                w,
+                h,
+                &Palette::default(),
+                &state,
+                10.0,
+                (OsdVisualMode::Text, collapsed),
+            );
+            drop(cr);
+            surface.flush();
+            let data = surface.data().unwrap();
+            assert_eq!(data[3], 0, "corner must be transparent");
+            if let Ok(dir) = std::env::var("VOXTYPE_TEST_RENDER_DIR") {
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::write(PathBuf::from(dir).join(format!("{name}.argb")), &*data).unwrap();
+            }
+        }
+    }
 
     #[test]
     fn wrap_tail_returns_short_text_untouched() {

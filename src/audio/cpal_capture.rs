@@ -9,8 +9,8 @@
 use super::AudioCapture;
 use crate::config::AudioConfig;
 use crate::error::AudioError;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use tokio::sync::{mpsc, oneshot};
 

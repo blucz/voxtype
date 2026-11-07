@@ -268,6 +268,16 @@ fn cancel_arm_path() -> PathBuf {
 fn cancel(double_tap_ms: Option<u64>) -> anyhow::Result<()> {
     let hint_path = voxtype::osd::preview::default_hint_path();
 
+    // A global cancellation chord must be harmless outside a dictation.
+    if double_tap_ms.is_some()
+        && std::fs::read_to_string(config::Config::runtime_dir().join("state"))
+            .map(|s| s.trim() == "idle")
+            .unwrap_or(true)
+    {
+        let _ = std::fs::remove_file(cancel_arm_path());
+        return Ok(());
+    }
+
     if let Some(window_ms) = double_tap_ms {
         let arm = cancel_arm_path();
         let armed = std::fs::metadata(&arm)
@@ -281,8 +291,11 @@ fn cancel(double_tap_ms: Option<u64>) -> anyhow::Result<()> {
             // fresh write updates mtime on every platform we target.
             std::fs::write(&arm, "armed")
                 .map_err(|e| anyhow::anyhow!("Failed to arm cancel: {}", e))?;
-            let _ =
-                voxtype::osd::preview::write_hint(&hint_path, "press again to discard", window_ms);
+            let _ = voxtype::osd::preview::write_hint(
+                &hint_path,
+                "Ctrl+Esc again to cancel · recoverable in corral",
+                window_ms,
+            );
             return Ok(());
         }
 

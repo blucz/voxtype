@@ -1165,6 +1165,7 @@ impl Daemon {
         // still handing us a stream — that open costs a few hundred ms, and
         // waiting for the first audio frame is what made the OSD look laggy.
         // Both failure paths below clear it again.
+        output::focus::clear();
         self.publish_preview("");
 
         let (capture, samples_rx) = match self.start_streaming_capture().await {
@@ -1274,6 +1275,7 @@ impl Daemon {
 
     /// Remove the preview file, telling the OSD the session is over.
     fn clear_preview(&self) {
+        output::focus::clear();
         if !self.config.osd.enabled {
             return;
         }
@@ -1305,6 +1307,7 @@ impl Daemon {
     /// drain, and stop the mic. Leaves `streaming_session`/`_chain` for
     /// the caller to disown (or keep, to receive trailing finals).
     async fn stop_streaming_capture(&mut self, audio_capture: &mut Option<Box<dyn AudioCapture>>) {
+        output::focus::capture().await;
         self.cut_streaming_audio();
         self.start_streaming_drain_pump();
         if let Some(mut c) = audio_capture.take() {
@@ -1367,7 +1370,8 @@ impl Daemon {
         }
 
         if let Some(s) = streaming_session.as_ref() {
-            self.journal(crate::journal::Outcome::Transcribed, s.finalized_text());
+            let retained = format!("{}{}", s.finalized_text(), s.partial());
+            self.journal(crate::journal::Outcome::Transcribed, &retained);
         }
 
         self.stop_streaming_drain_pump();
@@ -1414,26 +1418,34 @@ impl Daemon {
         // cancel a moment after a sentence would keep none of it. Nothing
         // here reaches the output chain: the drained text goes only to the
         // journal. Bounded so a wedged backend cannot hold the daemon.
-        let mut drained_finals = String::new();
-        let mut drained_partial = String::new();
+        // Keep the whole preview plus all newly drained deltas. Replacing
+        // it with the final tail loses almost an entire long dictation.
+        let mut discarded_tail = streaming_session
+            .as_ref()
+            .map(|s| s.partial().to_owned())
+            .unwrap_or_default();
         let backend_task = match streaming_handle.take() {
             Some(mut h) => {
                 let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
                 loop {
                     let ev = tokio::time::timeout_at(deadline, h.events.recv()).await;
                     match ev {
-                        Ok(Some(StreamingEvent::Partial { text, .. })) => drained_partial = text,
+                        Ok(Some(StreamingEvent::Partial { text, .. })) => {
+                            discarded_tail.push_str(&text)
+                        }
                         Ok(Some(StreamingEvent::Final { text, .. })) => {
-                            drained_finals.push_str(&text);
-                            drained_partial.clear();
+                            discarded_tail.push_str(&text);
                         }
-                        Ok(Some(StreamingEvent::Replace { backspace, text, .. })) => {
-                            let keep = drained_finals.chars().count().saturating_sub(backspace);
-                            drained_finals = drained_finals.chars().take(keep).collect();
-                            drained_finals.push_str(&text);
-                            drained_partial.clear();
+                        Ok(Some(StreamingEvent::Replace {
+                            backspace, text, ..
+                        })) => {
+                            let keep = discarded_tail.chars().count().saturating_sub(backspace);
+                            discarded_tail = discarded_tail.chars().take(keep).collect();
+                            discarded_tail.push_str(&text);
                         }
-                        Ok(Some(StreamingEvent::Ended)) | Ok(Some(StreamingEvent::Error(_))) | Ok(None) => break,
+                        Ok(Some(StreamingEvent::Ended))
+                        | Ok(Some(StreamingEvent::Error(_)))
+                        | Ok(None) => break,
                         Err(_) => {
                             tracing::warn!("Cancel drain timed out; aborting backend");
                             let _ = h.cancel.send(());
@@ -1457,12 +1469,7 @@ impl Daemon {
         // lose a long dictation on purpose, which makes it exactly the
         // case worth being able to undo.
         if let Some(s) = streaming_session.as_ref() {
-            let tail = if drained_finals.is_empty() && drained_partial.is_empty() {
-                s.partial().to_string()
-            } else {
-                format!("{}{}", drained_finals, drained_partial)
-            };
-            let discarded = format!("{}{}", s.finalized_text(), tail);
+            let discarded = format!("{}{}", s.finalized_text(), discarded_tail);
             self.journal(crate::journal::Outcome::Cancelled, &discarded);
         }
         self.stop_streaming_drain_pump();

@@ -69,6 +69,9 @@ pub fn write_preview(path: &Path, text: &str) -> io::Result<()> {
 /// Also drops any armed hint: hints are scoped to a session, and one left
 /// behind would reappear over the next recording's first frames.
 pub fn clear_preview(path: &Path) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::remove_file(parent.join("cancel_arm"));
+    }
     if path.exists() {
         if let Err(e) = std::fs::remove_file(path) {
             tracing::debug!("Failed to clear preview file: {}", e);

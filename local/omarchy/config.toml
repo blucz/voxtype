@@ -1,0 +1,36 @@
+# Voxtype-specific settings used by this fork's Omarchy installation.
+# Merge into config.toml; remove any old recording submap pre/post hooks.
+state_file = "auto"
+engine = "parakeet"
+
+[hotkey]
+enabled = false
+
+[audio]
+device = "default"
+sample_rate = 16000
+max_duration_secs = 0
+pause_media = true
+
+[output]
+mode = "paste"
+fallback_to_clipboard = true
+paste_keys = "shift+insert"
+restore_clipboard = true
+restore_clipboard_delay_ms = 300
+
+[parakeet]
+# Generated locally with scripts/quantize-unified-int8.py; not a download ID.
+model = "parakeet-unified-en-0.6b-int8"
+on_demand_loading = false
+streaming = true
+streaming_chunk_secs = 0.56
+streaming_left_context_secs = 5.6
+streaming_right_context_secs = 0.56
+
+[osd]
+position = "top-center"
+margin_px = 8
+visual_mode = "text"
+width_px = 480
+height_px = 82

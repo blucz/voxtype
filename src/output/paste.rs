@@ -859,6 +859,16 @@ impl TextOutput for PasteOutput {
         tokio::time::sleep(std::time::Duration::from_millis(delay as u64)).await;
 
         // Step 2: Simulate paste keystroke
+        if !super::focus::permits_delivery().await {
+            // Leave the dictation on the clipboard; do not inject into a
+            // window selected during the clipboard/pre-paste delay.
+            crate::notification::send(
+                "Voxtype",
+                "Window changed after Stop. Dictation saved to clipboard and corral.",
+            )
+            .await;
+            return Ok(());
+        }
         self.simulate_paste_keystroke().await?;
 
         // Send Enter key if configured

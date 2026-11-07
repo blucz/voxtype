@@ -322,3 +322,7 @@ path = "src/bin/voxtype_mirror_registry.rs"
 [[example]]
 name = "inspect_cohere_onnx"
 required-features = ["cohere"]
+
+[[example]]
+name = "stream-boundary-check"
+required-features = ["parakeet"]

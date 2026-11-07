@@ -6,25 +6,25 @@ upstream's and describes the project itself; this file describes only how this
 fork differs and how it is deployed. Keep them separate — editing upstream's
 `CLAUDE.md` creates rebase conflicts for no benefit.
 
-## The deployment is unusual
+## Local deployment
 
-Binaries built here are installed *over* two files owned by the Arch package
-`voxtype-bin`, rather than replacing the package:
+Run `~/.local/bin/voxtype-install-local` to build the daemon, OSD dispatcher,
+and GTK4 OSD with the ONNX engine features plus `osd-gtk4`. It installs
+versioned releases under `~/.local/libexec/voxtype/releases/`, atomically
+switches `current`, and updates the `~/.local/bin/voxtype*` symlinks. A user
+systemd drop-in selects `current/voxtype daemon`. No administrator password
+is needed. The installer refuses to restart during a dictation.
 
-- `target/release/voxtype` → `/usr/lib/voxtype/voxtype-onnx-avx2`
-- `target/release/voxtype-osd-gtk4` → `/usr/lib/voxtype/voxtype-osd-gtk4`
+Older local builds remain in `/usr/lib/voxtype/voxtype-onnx-avx2` and
+`/usr/lib/voxtype/voxtype-osd-gtk4`, protected by pacman's NoUpgrade entries.
+These package-owned paths are no longer written by the installer. For rollback,
+restore the saved config/bindings, remove the user binary links and
+`voxtype.service.d/local-build.conf`, reload systemd, and restart while idle.
 
-So `voxtype --version` reports this fork's version while `pacman -Qo` still
-credits `voxtype-bin`. That is expected, not corruption. `/etc/pacman.conf`
-has `NoUpgrade` entries for both paths so upgrades leave them alone and drop a
-`.pacnew` beside them instead.
+The versioned installer and dictation config fragments are in `local/omarchy/`.
 
-Rebuild and reinstall with `~/.local/bin/voxtype-install-local`. Building
-requires `cmake`, because `whisper-rs` is a hard dependency and compiles even
-when only the OSD binary is wanted.
-
-Full details, including why a `replaces=voxtype-bin` package was rejected:
-**`~/.config/omarchy/LOCAL-CUSTOMIZATIONS.md`** on that machine.
+Details and backups: `~/.config/omarchy/LOCAL-CUSTOMIZATIONS.md` and
+`~/.local/state/voxtype-update/`.
 
 ## What diverges from upstream
 
@@ -48,8 +48,8 @@ Behaviour changes worth submitting upstream:
   destroy. Arm state lives in a runtime file, since the caller is a
   short-lived compositor keybind.
 - A transcript journal (`output.transcript_journal`, on by default) writes
-  every utterance to `~/.local/state/voxtype/transcripts.jsonl` *before*
-  delivery, and writes cancelled ones too. `voxtype transcript last|list|path`
+  utterances to `~/.local/state/voxtype/transcripts.jsonl`, including
+  cancelled dictations and failed deliveries. `voxtype transcript last|list|path`
   reads it back. This is the only reason a mis-delivered dictation is
   recoverable at all.
 - The OSD text panel wrapped the *entire* transcript on every frame at 60 fps.
@@ -104,9 +104,22 @@ Local preferences, probably not wanted upstream as-is:
   at the cursor; the utterance is typed once on commit.
 - `visual_mode = "text"` OSD, fed by a preview file (`src/osd/preview.rs`)
   that the daemon writes atomically and the OSD polls at 20Hz.
-- Notch presentation: flush to the top edge, square corners, overlapping the
-  compositor bar. Requires layer-shell exclusive zone `-1`; `0` respects other
-  panels' reserved strips and lands the surface below the bar.
+- Compact text presentation: 480x82, two preview lines, elapsed clock, and
+  live amplitude bars. The grip and collapse/expand button are interactive;
+  the rest is click-through. The header has no brand label. Dragging uses
+  absolute cursor coordinates from Hyprland IPC, not GTK offsets relative to
+  the moving surface, so it tracks without feedback/lag. Dragging and collapse state
+  persist in
+  `~/.local/state/voxtype/osd-layout.json`; position is clamped after undocking.
+- Recording does not enter a Hyprland submap. Ctrl+Esc twice cancels with
+  recovery; ordinary Escape and normal desktop shortcuts remain usable.
+- Streaming flush deltas preserve SentencePiece whitespace. Cancellation
+  retains the existing preview plus every drained delta, without replaying
+  the last chunk after a flush failure.
+- Streaming Stop captures the current Hyprland window. Delivery waits for
+  shortcut modifiers to be released, then checks focus again (including just
+  before a paste keystroke). A changed window gets clipboard/corral recovery
+  instead of keystrokes. Failed delivery keeps the complete preview journaled.
 - The OSD maps its surface when the daemon publishes the preview file, not on
   the first audio frame, because opening the capture device costs ~0.6s.
 - The OSD text panel carries an elapsed clock in its left gutter and renders
